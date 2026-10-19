@@ -5,8 +5,10 @@ import re
 import time
 import traceback
 import zipfile
+from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
+from itertools import chain, islice, zip_longest
 from multiprocessing import freeze_support
 import warnings
 
@@ -26,6 +28,8 @@ SKIP_KEYWORDS = ["가공본", "통합정리", "~$"]  # 결과물/임시파일 �
 DATA_START_ROW = 5   # 실제 데이터 시작 추정 행
 VALIDATION_CHECK_MAX_COL = 14  # A:N 기준 검토 (이 열까지만 읽음)
 MAX_WORKERS = 0  # 동시에 처리할 프로세스 수 (0: 자동 = CPU 코어 수, 최대 8 / 1: 병렬 처리 안 함)
+EHT_FILE_KEYWORD = "EHT"  # 파일명에 이 글자가 있는 EHT LIST 를 같이 넣으면 TI 와 비교한 시트(EHT비교)를 추가
+EHT_LENGTH_TOLERANCE = 0.1  # EHT 길이와 TI 파이프 길이 차이가 이 값(m)보다 크면 '길이 차이'
 
 
 # =========================
@@ -543,6 +547,379 @@ def parse_insulation_workbook(file_path):
 
 
 # =========================
+# EHT LIST 비교
+# =========================
+# EHT LIST 한 행(ISO 시트 + DN)을 TI 의 같은 ISO 시트(시트번호 붙은 ISO NO) + DN 품목과 비교한다.
+# 길이는 파이프(Pipe/Труба/Tube)만, 밸브는 수량으로 두께별 합계를 낸다. (엘보/티/리듀서는 DN 이 없어 제외)
+# TI Note 에 전기히팅 표시가 있는 품목이 있으면 그 품목만 비교한다. (EHT 길이는 히팅 구간 기준)
+EHT_STATUSES = [  # (판정, 설명) - EHT비교요약 시트 순서
+    ("일치", "TI 파이프·밸브 두께가 모두 EHT 두께와 같고, 길이 차이도 {tol:g}m 이내"),
+    ("길이 차이", "두께는 같지만 EHT 길이와 TI 파이프 길이가 {tol:g}m 넘게 차이 남"),
+    ("두께 혼재", "TI에 EHT 두께와 다른 두께가 섞여 있음 ('EHT 두께 비율' 확인)"),
+    ("두께 불일치", "TI에 EHT 두께가 없음"),
+    ("TI에 DN 없음", "TI에 ISO 시트는 있으나 해당 DN의 파이프/밸브가 없음"),
+    ("TI에 ISO 없음", "TI-LST에 해당 ISO 시트가 없음"),
+    ("TI 제외라인", "TI에서 제외(Excluded)된 라인에만 있음"),
+    ("EHT에 없음", "TI Note에 전기히팅(There is electric heating) 표시가 있으나 EHT LIST에 해당 ISO 시트·DN이 없음"),
+    ("비교 제외", "Pumping Trap, DN이 숫자 하나가 아님(40x20 등), ISO/두께 없음, 길이·밸브 0이고 TI에 DN 없음"),
+]
+
+EHT_REPORT_COLUMNS = [
+    "판정", "내용",
+    "ISO NO", "DN", "EHT 라인", "EHT 배관재질", "EHT 보온구분", "EHT Remark",
+    "EHT 두께 (mm)", "EHT 길이 (m)", "EHT 밸브 (ea)",
+    "TI 파이프 두께별 길이", "TI 파이프 길이 (m)", "TI 중 EHT 두께 길이 (m)", "EHT 두께 비율 (%)", "길이 차이 (m)",
+    "TI 밸브 두께별 수량", "TI 밸브 (ea)",
+    "TI LINE NO", "TI 보온구분", "TI 파일",
+    "EHT 파일", "EHT 행",
+]
+
+EHT_SUMMARY_COLUMNS = ["판정", "건수", "설명"]
+
+EHT_HEADER_SCAN_ROWS = 30  # 머리글('ISO NUMBER')을 찾을 시트 위쪽 행 수
+EHT_FIELD_KEYWORDS = [  # (항목, 머리글 글자) - 2줄 머리글을 합쳐 소문자로 비교, 위에서부터 차례로 열을 정함
+    ("ISO", ("iso number", "iso no")),
+    ("DN", ("nominal diameter",)),
+    ("THK", ("thickness", "thk")),
+    ("Length", ("length",)),
+    ("Valve", ("valve",)),
+    ("Pipe Material", ("pipe material",)),
+    ("Insulation", ("insulation material", "material")),
+    ("Remark", ("remark",)),
+    ("ID", ("piping number", "equipment")),
+]
+EHT_REQUIRED_FIELDS = ("ISO", "DN", "THK")
+EHT_SUBHEADER_WORDS = ("nominal diameter", "thickness", "length", "material")
+HEATING_NOTES = ("there is electric heating", "имеется электрообогрев")
+INSULATION_TYPE_RE = re.compile(r"\b([A-Z]{1,3})\s*\(\s*([A-Z]{3,})\s*\)")  # H(OUTDOOR), H(REGEN) 등
+
+
+def to_number(value):
+    """숫자 또는 '1,15' / '0.1' 같은 글자를 float 로 바꾼다 (못 바꾸면 None)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        num = float(value)
+    else:
+        try:
+            num = float(clean_text(value).replace(" ", "").replace(",", "."))
+        except ValueError:
+            return None
+    return num if math.isfinite(num) else None
+
+
+def tidy_number(num):
+    num = round(float(num), 3)  # 합계가 0 이면 int 로 들어옴 (Python 3.8 의 int 에는 is_integer 가 없음)
+    return int(num) if num.is_integer() else num
+
+
+def dn_number(value):
+    """'DN 25' / 25 / '25' -> 25. 빈칸, '-', '40x20' 처럼 숫자 하나가 아니면 None."""
+    if isinstance(value, str):
+        value = re.sub(r"^\s*DN\s*", "", value, flags=re.IGNORECASE)
+    num = to_number(value)
+    return int(num) if num is not None and num.is_integer() else None
+
+
+def normalize_iso(text):
+    """비교용 ISO 키: 공백 제거, 대문자, 시트번호 2자리 ('...-ISO-00094-1' -> '...-ISO-00094-01')."""
+    s = re.sub(r"\s+", "", clean_text(text)).upper()
+    m = re.fullmatch(r"(.*-ISO-\d+)-(\d{1,2})", s)
+    return f"{m.group(1)}-{int(m.group(2)):02d}" if m else s
+
+
+def has_sheet_no(iso_key):
+    return re.search(r"-ISO-\d+-\d{2}$", iso_key) is not None
+
+
+def line_tokens(text):
+    return {t for t in re.split(r"[-/\s()]+", clean_text(text).upper()) if t}
+
+
+def thk_order(thk):
+    """두께 정렬: 숫자 -> 숫자가 아닌 글자(예: '30+30') -> 빈칸"""
+    if isinstance(thk, float):
+        return (0, thk, "")
+    return (1, 0, thk) if thk else (2, 0, "")
+
+
+def thk_label(thk):
+    if thk is None:
+        return "두께없음"
+    return f"{thk:g}mm" if isinstance(thk, float) else f"{thk}mm"
+
+
+def by_thk_text(amounts, unit):
+    """{두께: 양} -> '20mm 2.00m, 30mm 1.00m' (두께 순)"""
+    fmt = "{:.2f}m" if unit == "m" else "{:g}ea"
+    return ", ".join(f"{thk_label(thk)} {fmt.format(amounts[thk])}" for thk in sorted(amounts, key=thk_order))
+
+
+def pipe_valve_text(pipe, valve):
+    """파이프 길이 + 밸브 수량 -> '40mm 1.52m, 밸브 40mm 1ea'"""
+    parts = [by_thk_text(pipe, "m")] if pipe else []
+    if valve:
+        parts.append("밸브 " + by_thk_text(valve, "ea"))
+    return ", ".join(parts)
+
+
+def find_eht_columns(head):
+    """EHT LIST 머리글을 찾아 ({항목: 열 번호}, 데이터 시작 위치)를 돌려준다. 없으면 None."""
+    for idx, row in enumerate(head):
+        labels = [clean_text(v).lower() for v in row]
+        if not any("iso number" in t or "iso no" in t for t in labels):
+            continue
+
+        # 2줄 머리글(병합)이면 아래 행 글자도 합침: 'Insulation' + 'material', 'Detail of pipe' + 'Length (m)'
+        start = idx + 1
+        while start < len(head) and start - idx < 3:
+            sub = [clean_text(v).lower() for v in head[start]]
+            if not any(word in t for t in sub for word in EHT_SUBHEADER_WORDS):
+                break
+            labels = [f"{a} {b}".strip() for a, b in zip_longest(labels, sub, fillvalue="")]
+            start += 1
+
+        cols = {}
+        for field, words in EHT_FIELD_KEYWORDS:
+            for col, label in enumerate(labels):
+                if col not in cols.values() and any(word in label for word in words):
+                    cols[field] = col
+                    break
+        if all(field in cols for field in EHT_REQUIRED_FIELDS):
+            if "ID" not in cols and 0 not in cols.values():
+                cols["ID"] = 0  # 첫 열 = Equipment/piping number
+            return cols, start
+    return None
+
+
+def read_eht_list(file_path):
+    """EHT LIST 데이터 행을 읽는다. 'ISO NUMBER' 머리글이 있는 시트가 없으면 None (= EHT LIST 아님)."""
+    wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)  # VLOOKUP 등 수식은 계산된 값으로 읽음
+    try:
+        for ws in wb.worksheets:
+            ws.reset_dimensions()
+            rows = ws.iter_rows(values_only=True)
+            head = [list(row) for row in islice(rows, EHT_HEADER_SCAN_ROWS)]
+            found = find_eht_columns(head)
+            if not found:
+                continue
+
+            cols, data_start = found
+            records = []
+            for row_no, row in enumerate(chain(head[data_start:], rows), start=data_start + 1):
+                rec = {"EHT 파일": file_path.name, "EHT 행": row_no}
+                for field, col in cols.items():
+                    value = row[col] if col < len(row) else None
+                    rec[field] = clean_text(value) if isinstance(value, str) else value
+                if any(rec.get(field) not in (None, "") for field in ("ID", "DN", "ISO")):
+                    records.append(rec)
+            return records
+    finally:
+        wb.close()
+    return None
+
+
+def build_ti_groups(all_items):
+    """TI 품목을 (ISO 시트, DN) 별로 묶는다. DN 이 있는 품목(파이프/튜브/밸브)만 들어감."""
+    groups = defaultdict(list)
+    iso_dns = {}  # ISO 시트 -> TI 에 있는 DN (DN 없는 품목만 있어도 ISO 시트는 등록)
+    for rec in all_items:
+        iso = normalize_iso(rec.get("ISO NO"))
+        if not iso:
+            continue
+        dns = iso_dns.setdefault(iso, set())
+        dn = dn_number(rec.get("Nominal Diameter"))
+        if dn is None:
+            continue
+        dns.add(dn)
+
+        is_valve = "valve" in rec["Item Name"].lower()
+        thk_text = rec["Insulation Thickness (mm)"] or rec["Insulation Detail Thickness (mm)"]
+        thk = to_number(thk_text)
+        qty = to_number(rec["Qty"])
+        m_type = INSULATION_TYPE_RE.search(rec["Line Header"])
+        groups[(iso, dn)].append({
+            "iso_text": rec["ISO NO"],
+            "line": rec["LINE NO"],
+            "type": f"{m_type.group(1)}({m_type.group(2)})" if m_type else "",
+            "file": rec["Source File"],
+            "valve": is_valve,
+            "thk": round(thk, 1) if thk is not None else (thk_text or None),  # 숫자가 아니면 글자 그대로
+            "length": 0.0 if is_valve else (to_number(rec["Length/Height (m)"]) or 0.0),
+            "qty": (1.0 if qty is None else qty) if is_valve else 0.0,
+            "excluded": rec["Excluded"] == "Y",
+            "heating": any(word in rec["Note"].lower() for word in HEATING_NOTES),
+        })
+    return groups, iso_dns
+
+
+def summarize_ti(entries):
+    """TI 품목의 두께별 파이프 길이/밸브 수량과 비교 시트에 넣을 칸을 돌려준다."""
+    pipe, valve = defaultdict(float), defaultdict(float)
+    for e in entries:
+        if e["valve"]:
+            valve[e["thk"]] += e["qty"]
+        else:
+            pipe[e["thk"]] += e["length"]
+    columns = {
+        "TI 파이프 두께별 길이": by_thk_text(pipe, "m"),
+        "TI 파이프 길이 (m)": tidy_number(sum(pipe.values())),
+        "TI 밸브 두께별 수량": by_thk_text(valve, "ea"),
+        "TI 밸브 (ea)": tidy_number(sum(valve.values())),
+        "TI LINE NO": ", ".join(dict.fromkeys(e["line"] for e in entries)),
+        "TI 보온구분": ", ".join(dict.fromkeys(e["type"] for e in entries if e["type"])),
+        "TI 파일": ", ".join(dict.fromkeys(e["file"] for e in entries)),
+    }
+    return pipe, valve, columns
+
+
+def compare_eht_row(row, iso, dn, groups, ti_iso_dns, split, out):
+    """EHT 한 행을 TI 와 비교해 (판정, 내용 목록)을 돌려주고 TI 칸은 out 에 채운다."""
+    thk = to_number(row.get("THK"))
+    length = to_number(row.get("Length")) or 0.0
+    valves = to_number(row.get("Valve")) or 0.0
+
+    if "pumping trap" in clean_text(row.get("Remark")).lower():
+        return "비교 제외", ["Pumping Trap (장비)"]
+    if dn is None:
+        return "비교 제외", [f"DN이 숫자 하나가 아님 ({clean_text(row.get('DN')) or '빈칸'})"]
+    if not iso:
+        return "비교 제외", ["ISO NUMBER 없음"]
+    if thk is None:
+        return "비교 제외", [f"EHT 두께 확인 ({clean_text(row.get('THK')) or '빈칸'})"]
+    if iso not in ti_iso_dns:
+        if re.sub(r"-\d{2}$", "", iso) in ti_iso_dns:
+            return "TI에 ISO 없음", ["TI에는 시트번호 없는 ISO NO로 있음 (에러로그 SHEET_NO_NOT_FOUND 확인)"]
+        return "TI에 ISO 없음", []
+
+    entries = groups.get((iso, dn), [])
+    if not entries:
+        if length == 0 and valves == 0:
+            return "비교 제외", [f"EHT 길이·밸브 0 (플랜지/서포트만), TI에 DN {dn} 없음"]
+        ti_dns = ", ".join(map(str, sorted(ti_iso_dns[iso]))) or "없음"
+        return "TI에 DN 없음", [f"이 ISO 시트의 TI DN: {ti_dns}"]
+
+    active = [e for e in entries if not e["excluded"]]
+    if not active:
+        out.update(summarize_ti(entries)[2])
+        return "TI 제외라인", []
+
+    notes = []
+    # 같은 ISO 시트에 라인이 여럿이면 EHT 라인번호(끝의 시트번호 제외)가 들어 있는 TI 라인만 비교
+    eht_line = line_tokens(re.sub(r"-\d{1,2}$", "", clean_text(row.get("ID"))))
+    if eht_line:
+        same_line = [e for e in active if eht_line <= line_tokens(e["line"])]
+        if not same_line:
+            notes.append("TI LINE NO에 EHT 라인번호가 없음")
+        elif len(same_line) < len(active):
+            active = same_line
+    # EHT 가 같은 ISO 시트·DN 을 보온구분(H(INDOOR)/H(OUTDOOR) 등)으로 나눠 적었으면 TI 도 같은 구분끼리 비교
+    if split:
+        eht_type = re.sub(r"\s+", "", clean_text(row.get("Insulation"))).upper()
+        same_type = [e for e in active if e["type"] == eht_type]
+        if same_type:
+            active = same_type
+        else:
+            notes.append("TI를 보온구분으로 나눌 수 없어 해당 DN 전체와 비교")
+    # EHT 는 히팅 구간 기준이므로, TI Note 에 전기히팅 표시가 있는 품목이 있으면 그 품목끼리만 비교
+    heated = [e for e in active if e["heating"]]
+    if heated and len(heated) < len(active):
+        pipe_x, valve_x, _ = summarize_ti([e for e in active if not e["heating"]])
+        notes.append("전기히팅 표시 없는 TI 품목 제외: " + pipe_valve_text(pipe_x, valve_x))
+        active = heated
+
+    pipe, valve, columns = summarize_ti(active)
+    out.update(columns)
+    thk = round(thk, 1)
+    ti_length = sum(pipe.values())
+    ti_valves = round(sum(valve.values()), 3)
+    diff = round(ti_length - length, 3)
+    out["TI 중 EHT 두께 길이 (m)"] = tidy_number(pipe.get(thk, 0.0))
+    if ti_length > 0:
+        out["EHT 두께 비율 (%)"] = round(pipe.get(thk, 0.0) / ti_length * 100, 1)
+    elif ti_valves > 0:
+        out["EHT 두께 비율 (%)"] = round(valve.get(thk, 0.0) / ti_valves * 100, 1)  # 파이프가 없으면 밸브 수량 기준
+    out["길이 차이 (m)"] = tidy_number(diff)
+
+    thks = set(pipe) | set(valve)
+    if thk not in thks:
+        status = "두께 불일치"
+        notes.insert(0, "TI 두께: " + ", ".join(thk_label(t) for t in sorted(thks, key=thk_order)))
+    elif len(thks) > 1:
+        status = "두께 혼재"
+        other_pipe = {t: v for t, v in pipe.items() if t != thk}
+        other_valve = {t: v for t, v in valve.items() if t != thk}
+        notes.insert(0, "EHT 두께가 아닌 부분: " + pipe_valve_text(other_pipe, other_valve))
+    elif abs(diff) > EHT_LENGTH_TOLERANCE:
+        status = "길이 차이"
+    else:
+        status = "일치"
+
+    if abs(diff) > EHT_LENGTH_TOLERANCE:
+        notes.append(f"길이 TI {ti_length:.2f}m vs EHT {length:g}m")
+    if ti_valves != round(valves, 3):
+        notes.append(f"밸브 TI {ti_valves:g}ea vs EHT {valves:g}ea")
+    return status, notes
+
+
+def compare_eht(eht_rows, all_items):
+    """EHT LIST 각 행을 같은 ISO 시트·DN 의 TI 두께/길이와 비교한다. (비교 행, 요약 행)을 돌려준다."""
+    groups, ti_iso_dns = build_ti_groups(all_items)
+
+    prepared = []
+    eht_keys = Counter()
+    for row in eht_rows:
+        iso = normalize_iso(row.get("ISO"))
+        if iso and not has_sheet_no(iso):  # EHT ISO 에 시트번호가 없으면 라인번호 끝 숫자로 보충
+            sheet_no = get_sheet_no(row.get("ID"))
+            if sheet_no:
+                iso = normalize_iso(f"{iso}-{sheet_no}")
+        dn = dn_number(row.get("DN"))
+        prepared.append((row, iso, dn))
+        if iso and dn is not None:
+            eht_keys[(iso, dn)] += 1
+    eht_isos = {iso for _, iso, _ in prepared if iso}
+
+    report = []
+    for row, iso, dn in prepared:
+        out = dict.fromkeys(EHT_REPORT_COLUMNS)
+        out.update({
+            "ISO NO": row.get("ISO"), "DN": row.get("DN"), "EHT 라인": row.get("ID"),
+            "EHT 배관재질": row.get("Pipe Material"), "EHT 보온구분": row.get("Insulation"),
+            "EHT Remark": row.get("Remark"), "EHT 두께 (mm)": row.get("THK"),
+            "EHT 길이 (m)": row.get("Length"), "EHT 밸브 (ea)": row.get("Valve"),
+            "EHT 파일": row["EHT 파일"], "EHT 행": row["EHT 행"],
+        })
+        status, notes = compare_eht_row(row, iso, dn, groups, ti_iso_dns, eht_keys[(iso, dn)] > 1, out)
+        out["판정"] = status
+        out["내용"] = " / ".join(notes)
+        report.append(out)
+
+    # TI 에는 전기히팅 표시가 있는데 EHT LIST 에 없는 ISO 시트·DN (히팅 표시 품목만 보여줌)
+    for (iso, dn), entries in sorted(groups.items()):
+        heated = [e for e in entries if e["heating"] and not e["excluded"]]
+        if (iso, dn) in eht_keys or not heated:
+            continue
+        out = dict.fromkeys(EHT_REPORT_COLUMNS)
+        out.update(summarize_ti(heated)[2])
+        note = f"EHT LIST에 이 ISO 시트는 있으나 DN {dn} 없음" if iso in eht_isos else "EHT LIST에 이 ISO 시트가 없음"
+        if not has_sheet_no(iso):
+            note += " (TI ISO NO에 시트번호 없음)"
+        out.update({"판정": "EHT에 없음", "내용": note, "ISO NO": heated[0]["iso_text"], "DN": dn})
+        report.append(out)
+
+    counts = Counter(rec["판정"] for rec in report)
+    summary = [{"판정": status, "건수": counts[status], "설명": desc.format(tol=EHT_LENGTH_TOLERANCE)}
+               for status, desc in EHT_STATUSES]
+    summary.append({"판정": "합계", "건수": len(report),
+                    "설명": f"EHT LIST {len(eht_rows)}행 + EHT에 없음 {counts['EHT에 없음']}건"})
+    summary.append({"판정": "비교 기준", "설명": (
+        "ISO 시트(ISO NO + 시트번호)와 DN이 같은 TI 파이프(길이)·밸브(수량)의 보온 두께와 비교. "
+        "TI Note에 전기히팅 표시가 있는 품목이 있으면 그 품목만 비교. 엘보/티/리듀서는 DN이 없어 제외.")})
+    return report, summary
+
+
+# =========================
 # 파일 처리 (병렬)
 # =========================
 def process_file(file_path):
@@ -880,13 +1257,15 @@ def write_xlsx(output_path, sheets):
         zf.writestr("xl/sharedStrings.xml", strings.to_xml())
 
 
-def save_output_excel(output_path, all_items, all_excluded, summaries, errors):
+def save_output_excel(output_path, all_items, all_excluded, summaries, errors, eht_sheets=()):
+    """eht_sheets: EHT LIST 가 있을 때 뒤에 붙일 [(시트명, 레코드, 컬럼 순서)]"""
     sheets = []
     for title, records, preferred_cols in [
         ("통합정리데이터", all_items, ITEM_COLUMNS),
         ("파일별요약", summaries, ()),
         ("제외라인목록", all_excluded, EXCLUDED_COLUMNS),
         ("에러로그", errors, ERROR_COLUMNS),
+        *eht_sheets,
     ]:
         columns = order_columns(records, preferred_cols)
         rows = [[rec.get(col) for col in columns] for rec in records]
@@ -911,6 +1290,34 @@ def main():
             continue
         target_files.append(f)
 
+    all_items = []
+    all_excluded = []
+    summaries = []
+    errors = []
+
+    # EHT LIST: 파일명에 EHT_FILE_KEYWORD 가 있고 'ISO NUMBER' 머리글이 있으면 TI-LST 대신 EHT LIST 로 읽음
+    eht_files = []
+    eht_rows = []
+    for f in sorted(target_files):
+        if not EHT_FILE_KEYWORD or EHT_FILE_KEYWORD.lower() not in f.name.lower():
+            continue
+        try:
+            rows = read_eht_list(f)
+        except Exception as e:
+            errors.append({
+                "Source File": f.name, "Source Path": str(f), "Sheet Name": "",
+                "Issue Type": "EHT_LIST_ERROR", "Message": "EHT LIST 파일을 읽는 중 예외 발생",
+                "Error": str(e), "Traceback": traceback.format_exc(),
+            })
+            print(f"!! EHT LIST 읽기 오류: {f.name} ({e})")
+            target_files.remove(f)
+            continue
+        if rows is not None:
+            eht_files.append(f)
+            eht_rows.extend(rows)
+            print(f"EHT LIST: {f.name} ({len(rows)}행)")
+    target_files = [f for f in target_files if f not in eht_files]
+
     print(f"검색된 xlsx 파일 수: {len(files)}")
     print(f"실제 처리 대상 파일 수: {len(target_files)}")
 
@@ -919,16 +1326,21 @@ def main():
         input("엔터를 누르면 종료합니다...")
         return
 
-    all_items = []
-    all_excluded = []
-    summaries = []
-    errors = []
-
     for items, excluded, summary, parse_issues in process_files(sorted(target_files)):
         all_items.extend(items)
         all_excluded.extend(excluded)
         summaries.append(summary)
         errors.extend(parse_issues)
+
+    eht_sheets = []
+    eht_summary = []
+    if eht_files:
+        print("EHT LIST 비교 중...")
+        eht_report, eht_summary = compare_eht(eht_rows, all_items)
+        eht_sheets = [
+            ("EHT비교요약", eht_summary, EHT_SUMMARY_COLUMNS),
+            ("EHT비교", eht_report, EHT_REPORT_COLUMNS),
+        ]
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = base_dir / f"INSULATION_통합정리_{timestamp}.xlsx"
@@ -940,6 +1352,7 @@ def main():
         all_excluded=all_excluded,
         summaries=summaries,
         errors=errors,
+        eht_sheets=eht_sheets,
     )
 
     print("\n=== 작업 완료 ===")
@@ -947,6 +1360,8 @@ def main():
     print(f"총 아이템 수: {len(all_items)}")
     print(f"제외라인 수: {len(all_excluded)}")
     print(f"에러/검토이슈 수: {len(errors)}")
+    if eht_summary:
+        print("EHT 비교: " + ", ".join(f"{rec['판정']} {rec['건수']}" for rec in eht_summary if rec.get("건수")))
     print(f"소요 시간: {time.perf_counter() - started:.1f}초")
 
     input("엔터를 누르면 종료합니다...")

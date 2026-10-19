@@ -5,14 +5,19 @@
   (인자 없이 실행하면 이 폴더의 INSULATION_통합정리_*.xlsx 중 가장 최근 2개를 비교: 먼저 만든 파일 = 기존 결과)
 
 행 순서가 아니라 (Source File, Issue Type, Source Start Row) 기준으로 같은 항목끼리 비교하므로
-중간에 한 건이 빠지거나 늘어도 그 건만 보고된다.
+중간에 한 건이 빠지거나 늘어도 그 건만 보고된다. (EHT비교 시트는 EHT 파일·행, ISO NO, DN 기준)
 """
+from collections import Counter
 from pathlib import Path
 import sys
 
 import openpyxl
 
 KEY_COLUMNS = ["Source File", "Issue Type", "Source Start Row"]  # 시트에 있는 것만 사용
+SHEET_KEY_COLUMNS = {  # 위 기준이 맞지 않는 시트 (EHT LIST 를 같이 넣었을 때 생기는 시트)
+    "EHT비교": ["EHT 파일", "EHT 행", "ISO NO", "DN"],
+    "EHT비교요약": ["판정"],
+}
 IGNORE_COLUMNS = {"Source Path", "Traceback"}  # 실행 위치/코드 줄번호에 따라 달라지는 값
 MAX_SHOW = 10  # 항목별로 보여줄 최대 건수
 
@@ -27,12 +32,14 @@ def read_sheets(path):
             records = {}
             if rows and rows[0][0] != "데이터 없음":
                 header = rows[0]
-                key_cols = [c for c in KEY_COLUMNS if c in header]
-                for row in rows[1:]:
+                key_cols = [c for c in SHEET_KEY_COLUMNS.get(ws.title, KEY_COLUMNS) if c in header]
+                seen = Counter()
+                for row_no, row in enumerate(rows[1:], start=2):
                     rec = dict(zip(header, row))
-                    key = tuple(rec[c] for c in key_cols)
-                    while key in records:  # 같은 키가 또 있으면 순번을 붙여 구분
-                        key = key + ("#",)
+                    key = tuple(rec[c] for c in key_cols) if key_cols else (row_no,)  # 기준 열이 없으면 행 번호
+                    seen[key] += 1
+                    if seen[key] > 1:  # 같은 키가 또 있으면 순번을 붙여 구분
+                        key = key + (f"#{seen[key]}",)
                     records[key] = rec
             sheets[ws.title] = records
         return sheets
@@ -41,7 +48,7 @@ def read_sheets(path):
 
 
 def describe(rec):
-    label = rec.get("Item Name") or rec.get("Row Snapshot") or rec.get("Message") or ""
+    label = rec.get("Item Name") or rec.get("Row Snapshot") or rec.get("Message") or rec.get("내용") or ""
     return str(label)[:80]
 
 
@@ -78,6 +85,10 @@ def compare(old_path, new_path):
             print(f"  값이 다른 항목: {len(changed)}건")
             for key, diffs in sorted(changed, key=str)[:MAX_SHOW]:
                 print(f"    {key} " + ", ".join(f"{c}: {x!r} -> {y!r}" for c, x, y in diffs))
+
+    for title in [t for t in new if t not in old]:
+        same_all = False
+        print(f"[{title}] 새 결과에만 있는 시트 ({len(new[title])}건)")
 
     print("\n결과: " + ("두 파일 내용이 같습니다." if same_all else "차이가 있습니다. 위 내용을 확인하세요."))
 
