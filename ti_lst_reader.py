@@ -1,7 +1,13 @@
 from pathlib import Path
+import math
+import os
 import re
+import time
 import traceback
+import zipfile
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
+from multiprocessing import freeze_support
 import warnings
 
 # 경고 숨김 (데이터 처리에는 영향 없는 openpyxl 경고)
@@ -9,9 +15,6 @@ warnings.filterwarnings("ignore", message=r"Cannot parse header or footer.*")
 warnings.filterwarnings("ignore", message=r"DrawingML support is incomplete.*")
 
 import openpyxl
-import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
 
@@ -21,7 +24,8 @@ from openpyxl.utils import get_column_letter
 RECURSIVE = False   # True: 하위 폴더까지 검색 / False: 현재 폴더만 검색
 SKIP_KEYWORDS = ["가공본", "통합정리", "~$"]  # 결과물/임시파일 제외
 DATA_START_ROW = 5   # 실제 데이터 시작 추정 행
-VALIDATION_CHECK_MAX_COL = 14  # A:N 기준 검토
+VALIDATION_CHECK_MAX_COL = 14  # A:N 기준 검토 (이 열까지만 읽음)
+MAX_WORKERS = 0  # 동시에 처리할 프로세스 수 (0: 자동 = CPU 코어 수, 최대 8 / 1: 병렬 처리 안 함)
 
 
 # =========================
@@ -99,26 +103,37 @@ def get_target_sheet(workbook):
     return None
 
 
-def build_expanded_matrix(ws):
-    rows = ws.max_row
-    cols = ws.max_column
-    mat = [[ws.cell(r, c).value for c in range(1, cols + 1)] for r in range(1, rows + 1)]
+def read_sheet_rows(file_path):
+    """대상 시트의 A:N 값만 읽어 clean_text 처리된 행 목록으로 돌려준다.
 
-    for mr in list(ws.merged_cells.ranges):
-        min_col, min_row, max_col, max_row = mr.bounds
-        value = ws.cell(min_row, min_col).value
-        for rr in range(min_row, max_row + 1):
-            for cc in range(min_col, max_col + 1):
-                mat[rr - 1][cc - 1] = value
+    read_only 모드는 Cover Page/그림/서식을 통째로 메모리에 올리지 않고
+    대상 시트 XML만 순서대로 읽기 때문에 일반 모드보다 훨씬 빠르다.
+    병합셀은 왼쪽 위 셀에만 값이 있고, 라인/섹션/꼬리말 판정은 모두 A열 기준이라 펼치지 않는다.
+    """
+    wb = openpyxl.load_workbook(file_path, read_only=True, data_only=False)
+    try:
+        ws = get_target_sheet(wb)
+        if ws is None:
+            raise ValueError("대상 시트를 찾지 못했습니다. ('Техномонтажная ведомость' 등)")
 
-    return mat
+        sheet_name = ws.title
+        sheet_cols = ws.max_column  # 파일에 기록된 사용 범위 (없으면 None)
+
+        # 일부 프로그램이 만든 파일은 사용 범위 정보가 틀려 행이 잘려 읽히므로 끝까지 읽게 함
+        ws.reset_dimensions()
+        rows = [
+            [clean_text(v) for v in row]
+            for row in ws.iter_rows(max_col=VALIDATION_CHECK_MAX_COL, values_only=True)
+        ]
+    finally:
+        wb.close()  # read_only 모드는 파일 핸들을 열어두므로 반드시 닫음
+
+    return sheet_name, rows, sheet_cols or VALIDATION_CHECK_MAX_COL
 
 
-def get_row_values(mat, row_no, max_cols=VALIDATION_CHECK_MAX_COL):
-    row = [clean_text(v) for v in mat[row_no - 1][:max_cols]]
-    if len(row) < max_cols:
-        row.extend([""] * (max_cols - len(row)))
-    return row
+def get_row_values(mat, row_no):
+    # read_sheet_rows 에서 이미 A:N 으로 맞추고 clean_text 처리해 둠
+    return mat[row_no - 1]
 
 
 def is_pipeline_header(text):
@@ -226,61 +241,9 @@ def get_nominal_diameter(item_name, od_text, tolerance=0.3):
     return ""
 
 
-def autosize_worksheet(ws, min_width=10, max_width=45):
-    for col in range(1, ws.max_column + 1):
-        letter = get_column_letter(col)
-        max_len = 0
-        for row in range(1, ws.max_row + 1):
-            v = ws.cell(row, col).value
-            if v is None:
-                continue
-            length = len(str(v).replace("\n", " "))
-            if length > max_len:
-                max_len = length
-        ws.column_dimensions[letter].width = min(max(max_len * 0.95, min_width), max_width)
-
-
-def style_header_row(ws, row_no=1, color="1F4E78"):
-    for cell in ws[row_no]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor=color)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-
-def write_dataframe(ws, df):
-    if df.empty:
-        ws["A1"] = "데이터 없음"
-        return
-
-    for c_idx, col_name in enumerate(df.columns, start=1):
-        ws.cell(1, c_idx, col_name)
-
-    style_header_row(ws, 1)
-
-    for r_idx, (_, row) in enumerate(df.iterrows(), start=2):
-        for c_idx, value in enumerate(row, start=1):
-            ws.cell(r_idx, c_idx, value)
-
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-
-    autosize_worksheet(ws)
-
-
 def parse_insulation_workbook(file_path):
-    wb = openpyxl.load_workbook(file_path, data_only=False)
-    ws = get_target_sheet(wb)
-
-    if ws is None:
-        raise ValueError("대상 시트를 찾지 못했습니다. ('Техномонтажная ведомость' 등)")
-
-    mat = build_expanded_matrix(ws)
-    rows = ws.max_row
-    cols = ws.max_column
+    sheet_name, mat, cols = read_sheet_rows(file_path)
+    rows = len(mat)
 
     # ----- row 4가 Section인지, 바로 Pipeline Header인지 동적 판별 -----
     section_value = ""
@@ -333,7 +296,7 @@ def parse_insulation_workbook(file_path):
                 excluded_headers.append({
                     "Source File": file_path.name,
                     "Source Path": str(file_path),
-                    "Sheet Name": ws.title,
+                    "Sheet Name": sheet_name,
                     "Section": section_value,
                     **current_header,
                     "Source Start Row": r,
@@ -348,7 +311,7 @@ def parse_insulation_workbook(file_path):
             rec = {
                 "Source File": file_path.name,
                 "Source Path": str(file_path),
-                "Sheet Name": ws.title,
+                "Sheet Name": sheet_name,
                 "Section": section_value,
 
                 "Line Header": current_header.get("Line Header", ""),
@@ -391,6 +354,11 @@ def parse_insulation_workbook(file_path):
                 if is_pipeline_header(na) or nb or is_footer_row(na):
                     break
 
+                # 병합셀을 펼치지 않으므로 A열에만 값이 있는 행(섹션/반복 표머리/메모 등)도
+                # 상세행으로 흡수하지 않고 끊는다 → 미분류 행으로 에러로그에 기록됨
+                if na:
+                    break
+
                 if not is_meaningful_row(next_row):
                     # 완전 공란 행이면 item 범위에 넣지 않고 넘어감
                     break
@@ -430,7 +398,7 @@ def parse_insulation_workbook(file_path):
                 parse_issues.append({
                     "Source File": file_path.name,
                     "Source Path": str(file_path),
-                    "Sheet Name": ws.title,
+                    "Sheet Name": sheet_name,
                     "Issue Type": "MISSING_LINE_OR_ISO_ON_ITEM",
                     "Message": "ITEM은 추출되었으나 LINE NO 또는 ISO NO가 비어 있습니다.",
                     "Row No": rec["Source Start Row"],
@@ -450,7 +418,7 @@ def parse_insulation_workbook(file_path):
         parse_issues.append({
             "Source File": file_path.name,
             "Source Path": str(file_path),
-            "Sheet Name": ws.title,
+            "Sheet Name": sheet_name,
             "Issue Type": "UNPARSED_ROW_DURING_SCAN",
             "Message": "의미 있는 행이지만 ITEM/HEADER/FOOTER로 분류되지 않았습니다.",
             "Row No": r,
@@ -478,7 +446,7 @@ def parse_insulation_workbook(file_path):
         parse_issues.append({
             "Source File": file_path.name,
             "Source Path": str(file_path),
-            "Sheet Name": ws.title,
+            "Sheet Name": sheet_name,
             "Issue Type": "UNCOVERED_MEANINGFUL_ROW",
             "Message": "통합정리데이터의 Source Start/End 범위 어떤 곳에도 포함되지 않은 의미 있는 행입니다.",
             "Row No": chk_row,
@@ -496,7 +464,7 @@ def parse_insulation_workbook(file_path):
     summary = {
         "Source File": file_path.name,
         "Source Path": str(file_path),
-        "Sheet Name": ws.title,
+        "Sheet Name": sheet_name,
         "Rows": rows,
         "Columns": cols,
         "Item Count": len(item_records),
@@ -511,69 +479,362 @@ def parse_insulation_workbook(file_path):
     return item_records, excluded_headers, summary, parse_issues
 
 
+# =========================
+# 파일 처리 (병렬)
+# =========================
+def process_file(file_path):
+    """파일 1개 처리 (병렬 처리 단위). 오류가 나면 예외 대신 ERROR 요약/로그를 돌려준다."""
+    try:
+        return parse_insulation_workbook(file_path)
+    except Exception as e:
+        summary = {
+            "Source File": file_path.name,
+            "Source Path": str(file_path),
+            "Sheet Name": "",
+            "Rows": "",
+            "Columns": "",
+            "Item Count": 0,
+            "Unique LINE NO": 0,
+            "Unique ISO NO": 0,
+            "Excluded Header Count": 0,
+            "Coverage Issue Count": 0,
+            "Status": "ERROR",
+            "Message": str(e),
+        }
+        error = {
+            "Source File": file_path.name,
+            "Source Path": str(file_path),
+            "Sheet Name": "",
+            "Issue Type": "FILE_PROCESSING_ERROR",
+            "Message": "파일 처리 중 예외 발생",
+            "Row No": "",
+            "Source Start Row": "",
+            "Source End Row": "",
+            "LINE NO": "",
+            "ISO NO": "",
+            "Item Name": "",
+            "Row Snapshot": "",
+            "Error": str(e),
+            "Traceback": traceback.format_exc(),
+        }
+        return [], [], summary, [error]
+
+
+def print_progress(idx, total, file_path, result):
+    items, excluded, summary, parse_issues = result
+    if summary["Status"] == "ERROR":
+        print(f"[{idx}/{total}] !! 오류 발생: {file_path.name}")
+        print(f"       {summary['Message']}")
+    else:
+        print(f"[{idx}/{total}] {file_path.name} -> "
+              f"ITEM {len(items)}건, 제외라인 {len(excluded)}건, 검토이슈 {len(parse_issues)}건")
+
+
+def process_files(target_files):
+    """모든 파일을 처리해 파일 순서대로 결과 목록을 돌려준다 (가능하면 여러 프로세스로 동시 처리)."""
+    total = len(target_files)
+    workers = MAX_WORKERS if MAX_WORKERS > 0 else min(os.cpu_count() or 1, 8)
+    workers = min(workers, total)
+
+    if workers > 1:
+        print(f"병렬 처리: 프로세스 {workers}개")
+        try:
+            results = []
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                for idx, (file_path, result) in enumerate(
+                    zip(target_files, executor.map(process_file, target_files)), start=1
+                ):
+                    print_progress(idx, total, file_path, result)
+                    results.append(result)
+            return results
+        except Exception as e:
+            # 일부 IDE(Spyder/Jupyter 등) 실행 환경에서는 병렬 처리가 막힐 수 있음
+            print(f"병렬 처리를 사용할 수 없어 순차 처리로 다시 진행합니다. ({e!r})")
+
+    results = []
+    for idx, file_path in enumerate(target_files, start=1):
+        result = process_file(file_path)
+        print_progress(idx, total, file_path, result)
+        results.append(result)
+    return results
+
+
+# =========================
+# 결과 엑셀 저장
+# =========================
+ITEM_COLUMNS = [
+    "Source File", "Section",
+    "LINE NO", "ISO NO", "INDOOR/OUTDOOR", "Excluded", "Exclusion Letter",
+    "Item Name", "Brand/Position",
+    "Size (mm)", "Nominal Diameter", "Length/Height (m)", "Qty", "Temperature (°C)",
+    "Purpose/Location",
+    "Insulation Material", "Insulation Thickness (mm)",
+    "Insulation Detail", "Insulation Detail Thickness (mm)",
+    "Covering Material", "Covering Thickness (mm)", "Covering Surface (m²)",
+    "Surface (m²)", "Volume of Insulation Layer (m³)",
+    "Document Designation", "Note",
+    "Line Header",
+    "Sheet Name", "Source Path",
+    "Source Start Row", "Source End Row",
+]
+
+EXCLUDED_COLUMNS = [
+    "Source File", "Section", "LINE NO", "ISO NO", "INDOOR/OUTDOOR",
+    "Excluded", "Exclusion Letter", "Line Header", "Sheet Name", "Source Path",
+    "Source Start Row", "Source End Row",
+]
+
+ERROR_COLUMNS = [
+    "Source File", "Source Path", "Sheet Name", "Issue Type", "Message",
+    "Row No", "Source Start Row", "Source End Row",
+    "LINE NO", "ISO NO", "Item Name", "Row Snapshot",
+    "Error", "Traceback",
+]
+
+
+def order_columns(records, preferred_cols=()):
+    """레코드에 있는 컬럼을 preferred_cols 순서로 앞에 두고, 나머지는 처음 나온 순서대로 뒤에 붙인다."""
+    all_cols = list(dict.fromkeys(key for rec in records for key in rec))
+    existing_cols = [c for c in preferred_cols if c in all_cols]
+    other_cols = [c for c in all_cols if c not in existing_cols]
+    return existing_cols + other_cols
+
+
+def column_widths(columns, rows, min_width=10, max_width=45):
+    """열 너비 자동 조정: 헤더 포함 최대 글자 수 × 0.95 를 min~max 범위로 제한."""
+    max_lens = [len(str(col)) for col in columns]
+    for row in rows:
+        for idx, value in enumerate(row):
+            if value is None:
+                continue
+            length = len(value) if isinstance(value, str) else len(str(value))
+            if length > max_lens[idx]:
+                max_lens[idx] = length
+    return [min(max(length * 0.95, min_width), max_width) for length in max_lens]
+
+
+# ----- xlsx 직접 작성 -----
+# openpyxl 로 셀마다 서식을 지정해 저장하면 수십만 셀에서 매우 느려서(원래 코드의 최대 병목),
+# 필요한 서식 2가지만 정의한 xlsx(XML 묶음)를 직접 만든다.
+#   헤더: 굵은 흰 글씨 + 남색(1F4E78) 배경 + 가운데 정렬 + 줄바꿈
+#   데이터: 위쪽 정렬 + 줄바꿈 / 틀 고정(A2), 자동 필터, 열 너비 자동
+HEADER_STYLE = 1
+DATA_STYLE = 2
+
+EXCEL_MAX_CELL_CHARS = 32767
+ILLEGAL_XML_CHARS_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
+
+XML_DECLARATION = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+NS_PACKAGE_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml"
+
+STYLES_XML = (
+    XML_DECLARATION
+    + f'<styleSheet xmlns="{NS_MAIN}">'
+    '<fonts count="2">'
+    '<font><sz val="11"/><name val="Calibri"/><family val="2"/></font>'
+    '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/><family val="2"/></font>'
+    '</fonts>'
+    '<fills count="3">'
+    '<fill><patternFill patternType="none"/></fill>'
+    '<fill><patternFill patternType="gray125"/></fill>'
+    '<fill><patternFill patternType="solid"><fgColor rgb="FF1F4E78"/><bgColor indexed="64"/></patternFill></fill>'
+    '</fills>'
+    '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+    '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+    '<cellXfs count="3">'
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+    '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1">'
+    '<alignment horizontal="center" vertical="center" wrapText="1"/></xf>'
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1">'
+    '<alignment vertical="top" wrapText="1"/></xf>'
+    '</cellXfs>'
+    '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+    '</styleSheet>'
+)
+
+
+def xml_escape(text):
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+class SharedStrings:
+    """xlsx 공유 문자열 표: 같은 문자열은 한 번만 저장하고 셀에는 번호만 기록한다."""
+
+    def __init__(self):
+        self.index_of = {}
+        self.ref_count = 0
+
+    def index(self, text):
+        self.ref_count += 1
+        idx = self.index_of.get(text)
+        if idx is None:
+            idx = self.index_of[text] = len(self.index_of)
+        return idx
+
+    def to_xml(self):
+        items = "".join(
+            '<si><t xml:space="preserve">'
+            + xml_escape(ILLEGAL_XML_CHARS_RE.sub("", text)[:EXCEL_MAX_CELL_CHARS])
+            + "</t></si>"
+            for text in self.index_of
+        )
+        return (XML_DECLARATION
+                + f'<sst xmlns="{NS_MAIN}" count="{self.ref_count}" uniqueCount="{len(self.index_of)}">'
+                + items + "</sst>")
+
+
+def cell_xml(ref, value, style, strings):
+    style_attr = f' s="{style}"' if style else ""
+    if value is None or value == "":
+        return f'<c r="{ref}"{style_attr}/>' if style else ""
+    if isinstance(value, bool):
+        return f'<c r="{ref}"{style_attr} t="b"><v>{int(value)}</v></c>'
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            return f'<c r="{ref}"{style_attr}/>'
+        return f'<c r="{ref}"{style_attr}><v>{value!r}</v></c>'
+    return f'<c r="{ref}"{style_attr} t="s"><v>{strings.index(str(value))}</v></c>'
+
+
+def write_sheet_xml(fh, columns, rows, strings, selected):
+    tab = ' tabSelected="1"' if selected else ""
+    head = XML_DECLARATION + f'<worksheet xmlns="{NS_MAIN}" xmlns:r="{NS_REL}">'
+
+    if not rows:
+        fh.write((
+            head
+            + '<dimension ref="A1"/>'
+            + f'<sheetViews><sheetView{tab} workbookViewId="0"/></sheetViews>'
+            + '<sheetFormatPr defaultRowHeight="15"/>'
+            + '<sheetData><row r="1">' + cell_xml("A1", "데이터 없음", 0, strings) + "</row></sheetData>"
+            + "</worksheet>"
+        ).encode("utf-8"))
+        return
+
+    letters = [get_column_letter(idx) for idx in range(1, len(columns) + 1)]
+    data_range = f"A1:{letters[-1]}{len(rows) + 1}"
+    cols_xml = "".join(
+        f'<col min="{idx}" max="{idx}" width="{width:.2f}" customWidth="1"/>'
+        for idx, width in enumerate(column_widths(columns, rows), start=1)
+    )
+    header_cells = "".join(
+        cell_xml(f"{letter}1", col, HEADER_STYLE, strings) for letter, col in zip(letters, columns)
+    )
+    fh.write((
+        head
+        + f'<dimension ref="{data_range}"/>'
+        + f'<sheetViews><sheetView{tab} workbookViewId="0">'
+        + '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+        + '<selection pane="bottomLeft" activeCell="A2" sqref="A2"/>'
+        + "</sheetView></sheetViews>"
+        + '<sheetFormatPr defaultRowHeight="15"/>'
+        + f"<cols>{cols_xml}</cols>"
+        + f'<sheetData><row r="1">{header_cells}</row>'
+    ).encode("utf-8"))
+
+    chunk = []
+    for r_idx, row in enumerate(rows, start=2):
+        cells = "".join(
+            cell_xml(f"{letter}{r_idx}", value, DATA_STYLE, strings) for letter, value in zip(letters, row)
+        )
+        chunk.append(f'<row r="{r_idx}">{cells}</row>')
+        if len(chunk) >= 2000:
+            fh.write("".join(chunk).encode("utf-8"))
+            chunk = []
+    chunk.append(f'</sheetData><autoFilter ref="{data_range}"/></worksheet>')
+    fh.write("".join(chunk).encode("utf-8"))
+
+
+def write_xlsx(output_path, sheets):
+    """sheets: [(시트명, 컬럼 목록, 행 목록)] 을 xlsx 파일 하나로 저장한다."""
+    strings = SharedStrings()
+    count = len(sheets)
+
+    sheet_entries = []
+    filter_names = []
+    for idx, (title, columns, rows) in enumerate(sheets, start=1):
+        sheet_entries.append(f'<sheet name="{xml_escape(title)}" sheetId="{idx}" r:id="rId{idx}"/>')
+        if rows:
+            last_ref = f"${get_column_letter(len(columns))}${len(rows) + 1}"
+            quoted_title = "'" + title.replace("'", "''") + "'"
+            filter_names.append(
+                f'<definedName name="_xlnm._FilterDatabase" localSheetId="{idx - 1}" hidden="1">'
+                f"{xml_escape(quoted_title)}!$A$1:{last_ref}</definedName>"
+            )
+
+    workbook_xml = (
+        XML_DECLARATION
+        + f'<workbook xmlns="{NS_MAIN}" xmlns:r="{NS_REL}">'
+        + '<bookViews><workbookView activeTab="0"/></bookViews>'
+        + "<sheets>" + "".join(sheet_entries) + "</sheets>"
+        + ("<definedNames>" + "".join(filter_names) + "</definedNames>" if filter_names else "")
+        + "</workbook>"
+    )
+    workbook_rels = (
+        XML_DECLARATION
+        + f'<Relationships xmlns="{NS_PACKAGE_REL}">'
+        + "".join(
+            f'<Relationship Id="rId{idx}" Type="{NS_REL}/worksheet" Target="worksheets/sheet{idx}.xml"/>'
+            for idx in range(1, count + 1)
+        )
+        + f'<Relationship Id="rId{count + 1}" Type="{NS_REL}/styles" Target="styles.xml"/>'
+        + f'<Relationship Id="rId{count + 2}" Type="{NS_REL}/sharedStrings" Target="sharedStrings.xml"/>'
+        + "</Relationships>"
+    )
+    content_types = (
+        XML_DECLARATION
+        + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        + '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        + '<Default Extension="xml" ContentType="application/xml"/>'
+        + f'<Override PartName="/xl/workbook.xml" ContentType="{CONTENT_TYPE}.sheet.main+xml"/>'
+        + f'<Override PartName="/xl/styles.xml" ContentType="{CONTENT_TYPE}.styles+xml"/>'
+        + f'<Override PartName="/xl/sharedStrings.xml" ContentType="{CONTENT_TYPE}.sharedStrings+xml"/>'
+        + "".join(
+            f'<Override PartName="/xl/worksheets/sheet{idx}.xml" ContentType="{CONTENT_TYPE}.worksheet+xml"/>'
+            for idx in range(1, count + 1)
+        )
+        + "</Types>"
+    )
+    root_rels = (
+        XML_DECLARATION
+        + f'<Relationships xmlns="{NS_PACKAGE_REL}">'
+        + f'<Relationship Id="rId1" Type="{NS_REL}/officeDocument" Target="xl/workbook.xml"/>'
+        + "</Relationships>"
+    )
+
+    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", root_rels)
+        zf.writestr("xl/workbook.xml", workbook_xml)
+        zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+        zf.writestr("xl/styles.xml", STYLES_XML)
+        for idx, (title, columns, rows) in enumerate(sheets, start=1):
+            with zf.open(f"xl/worksheets/sheet{idx}.xml", "w") as fh:
+                write_sheet_xml(fh, columns, rows, strings, selected=(idx == 1))
+        zf.writestr("xl/sharedStrings.xml", strings.to_xml())
+
+
 def save_output_excel(output_path, all_items, all_excluded, summaries, errors):
-    wb = Workbook()
-    wb.remove(wb.active)
+    sheets = []
+    for title, records, preferred_cols in [
+        ("통합정리데이터", all_items, ITEM_COLUMNS),
+        ("파일별요약", summaries, ()),
+        ("제외라인목록", all_excluded, EXCLUDED_COLUMNS),
+        ("에러로그", errors, ERROR_COLUMNS),
+    ]:
+        columns = order_columns(records, preferred_cols)
+        rows = [[rec.get(col) for col in columns] for rec in records]
+        sheets.append((title, columns, rows))
 
-    ws_items = wb.create_sheet("통합정리데이터")
-    df_items = pd.DataFrame(all_items)
-    if not df_items.empty:
-        preferred_cols = [
-            "Source File", "Section",
-            "LINE NO", "ISO NO", "INDOOR/OUTDOOR", "Excluded", "Exclusion Letter",
-            "Item Name", "Brand/Position",
-            "Size (mm)", "Nominal Diameter", "Length/Height (m)", "Qty", "Temperature (°C)",
-            "Purpose/Location",
-            "Insulation Material", "Insulation Thickness (mm)",
-            "Insulation Detail", "Insulation Detail Thickness (mm)",
-            "Covering Material", "Covering Thickness (mm)", "Covering Surface (m²)",
-            "Surface (m²)", "Volume of Insulation Layer (m³)",
-            "Document Designation", "Note",
-            "Line Header",
-            "Sheet Name", "Source Path",
-            "Source Start Row", "Source End Row",
-        ]
-        existing_cols = [c for c in preferred_cols if c in df_items.columns]
-        other_cols = [c for c in df_items.columns if c not in existing_cols]
-        df_items = df_items[existing_cols + other_cols]
-    write_dataframe(ws_items, df_items)
-
-    ws_sum = wb.create_sheet("파일별요약")
-    df_sum = pd.DataFrame(summaries)
-    write_dataframe(ws_sum, df_sum)
-
-    ws_exc = wb.create_sheet("제외라인목록")
-    df_exc = pd.DataFrame(all_excluded)
-    if not df_exc.empty:
-        preferred_cols = [
-            "Source File", "Section", "LINE NO", "ISO NO", "INDOOR/OUTDOOR",
-            "Excluded", "Exclusion Letter", "Line Header", "Sheet Name", "Source Path",
-            "Source Start Row", "Source End Row",
-        ]
-        existing_cols = [c for c in preferred_cols if c in df_exc.columns]
-        other_cols = [c for c in df_exc.columns if c not in existing_cols]
-        df_exc = df_exc[existing_cols + other_cols]
-    write_dataframe(ws_exc, df_exc)
-
-    ws_err = wb.create_sheet("에러로그")
-    df_err = pd.DataFrame(errors)
-    if not df_err.empty:
-        preferred_cols = [
-            "Source File", "Source Path", "Sheet Name", "Issue Type", "Message",
-            "Row No", "Source Start Row", "Source End Row",
-            "LINE NO", "ISO NO", "Item Name", "Row Snapshot",
-            "Error", "Traceback",
-        ]
-        existing_cols = [c for c in preferred_cols if c in df_err.columns]
-        other_cols = [c for c in df_err.columns if c not in existing_cols]
-        df_err = df_err[existing_cols + other_cols]
-    write_dataframe(ws_err, df_err)
-
-    wb.save(output_path)
+    write_xlsx(output_path, sheets)
 
 
 def main():
     print("=== START PROGRAM ===")
+    started = time.perf_counter()
 
     base_dir = Path(__file__).resolve().parent
     print(f"작업 폴더: {base_dir}")
@@ -600,54 +861,11 @@ def main():
     summaries = []
     errors = []
 
-    for idx, file_path in enumerate(sorted(target_files), start=1):
-        print(f"[{idx}/{len(target_files)}] 처리 중: {file_path.name}")
-
-        try:
-            items, excluded, summary, parse_issues = parse_insulation_workbook(file_path)
-
-            all_items.extend(items)
-            all_excluded.extend(excluded)
-            summaries.append(summary)
-            errors.extend(parse_issues)
-
-            print(f"    -> ITEM {len(items)}건, 제외라인 {len(excluded)}건, 검토이슈 {len(parse_issues)}건")
-
-        except Exception as e:
-            print(f"    !! 오류 발생: {file_path.name}")
-            print(f"       {e}")
-
-            summaries.append({
-                "Source File": file_path.name,
-                "Source Path": str(file_path),
-                "Sheet Name": "",
-                "Rows": "",
-                "Columns": "",
-                "Item Count": 0,
-                "Unique LINE NO": 0,
-                "Unique ISO NO": 0,
-                "Excluded Header Count": 0,
-                "Coverage Issue Count": 0,
-                "Status": "ERROR",
-                "Message": str(e),
-            })
-
-            errors.append({
-                "Source File": file_path.name,
-                "Source Path": str(file_path),
-                "Sheet Name": "",
-                "Issue Type": "FILE_PROCESSING_ERROR",
-                "Message": "파일 처리 중 예외 발생",
-                "Row No": "",
-                "Source Start Row": "",
-                "Source End Row": "",
-                "LINE NO": "",
-                "ISO NO": "",
-                "Item Name": "",
-                "Row Snapshot": "",
-                "Error": str(e),
-                "Traceback": traceback.format_exc(),
-            })
+    for items, excluded, summary, parse_issues in process_files(sorted(target_files)):
+        all_items.extend(items)
+        all_excluded.extend(excluded)
+        summaries.append(summary)
+        errors.extend(parse_issues)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = base_dir / f"INSULATION_통합정리_{timestamp}.xlsx"
@@ -666,11 +884,13 @@ def main():
     print(f"총 아이템 수: {len(all_items)}")
     print(f"제외라인 수: {len(all_excluded)}")
     print(f"에러/검토이슈 수: {len(errors)}")
+    print(f"소요 시간: {time.perf_counter() - started:.1f}초")
 
     input("엔터를 누르면 종료합니다...")
 
 
 if __name__ == "__main__":
+    freeze_support()  # exe로 묶어 실행할 때 병렬 처리용
     try:
         main()
     except Exception as e:
