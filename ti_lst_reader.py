@@ -77,6 +77,8 @@ OD_TO_DN_MAP = {
     2032.00: "DN 2000",
 }
 
+DN_VALUES = set(OD_TO_DN_MAP.values())  # 유효한 DN 호칭 목록 (DN 6 ~ DN 2000)
+
 
 # =========================
 # Tube 규격 -> Nominal Diameter (DN) 변환표
@@ -247,12 +249,19 @@ def get_nominal_diameter(item_name, od_text, tolerance=0.3):
         m = re.search(r"tubing size:\s*([\d/ -]+?)\s*inch", name)
         return TUBE_SIZE_TO_DN.get(m.group(1), "") if m else ""
 
-    if not ("pipe" in name or "труба" in name):
+    is_valve = "valve" in name
+    if not (is_valve or "pipe" in name or "труба" in name):
         return ""
 
     od_val = parse_size_to_float(od_text)
     if od_val is None:
         return ""
+
+    # Valve 는 Size 칸에 외경이 아니라 호칭경이 적혀 있음 (25,0 -> DN 25).
+    # 외경표에는 25.00(DN 20), 32.00(DN 25) 같은 값이 있어 표로 찾으면 틀리므로 먼저 확인한다.
+    # DN 값이 아니면(외경을 적은 경우 등) 아래 외경표로 찾는다.
+    if is_valve and od_val.is_integer() and f"DN {int(od_val)}" in DN_VALUES:
+        return f"DN {int(od_val)}"
 
     for ref_od, dn in OD_TO_DN_MAP.items():
         if abs(od_val - ref_od) <= tolerance:
