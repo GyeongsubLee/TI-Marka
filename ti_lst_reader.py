@@ -167,6 +167,19 @@ def is_meaningful_row(row_vals):
     return any(clean_text(v) for v in row_vals)
 
 
+def get_sheet_no(line_no):
+    """LINE NO 오른쪽 끝의 시트번호 ('12200-24-4312/341-P44-0018-ASB0T00NN51-01 (H)' -> '01').
+
+    끝에 붙은 '(H)', 'H(REGEN)' 같은 꼬리표는 건너뛰고, 오른쪽부터 '-숫자(1~2자리)'로 끝나는 부분을 찾는다.
+    TRIM 라인('.../351-F-101-XT-01')처럼 구조가 달라도 끝자리만 보므로 같은 방식으로 찾는다. 없으면 빈칸.
+    """
+    for token in reversed(clean_text(line_no).split()):
+        m = re.search(r"-(\d{1,2})$", re.sub(r"\([^()]*\)", "", token))
+        if m:
+            return m.group(1)
+    return ""
+
+
 def parse_pipeline_header(text):
     t = clean_text(text)
 
@@ -207,6 +220,10 @@ def parse_pipeline_header(text):
     m_iso = re.search(r"(GCC-[A-Z0-9-]*TKM-ISO-\d+)", t, flags=re.IGNORECASE)
     if m_iso:
         result["ISO NO"] = m_iso.group(1)
+        # ISO NO 뒤에 시트번호(LINE NO 오른쪽 끝 숫자)를 붙임: ...-TKM-ISO-00094 -> ...-TKM-ISO-00094-01
+        sheet_no = get_sheet_no(result["LINE NO"])
+        if sheet_no:
+            result["ISO NO"] += f"-{sheet_no}"
 
     if "excluded according to the letter" in t.lower() or "исключено согласно письму" in t.lower():
         result["Excluded"] = "Y"
@@ -320,6 +337,23 @@ def parse_insulation_workbook(file_path):
         if is_pipeline_header(a):
             current_header = parse_pipeline_header(a)
             covered_rows.add(r)
+
+            # 시트번호를 못 찾으면 ISO NO 가 시트번호 없이 남으므로 검토이슈로 남김
+            if current_header["LINE NO"] and current_header["ISO NO"] and not get_sheet_no(current_header["LINE NO"]):
+                parse_issues.append({
+                    "Source File": file_path.name,
+                    "Source Path": str(file_path),
+                    "Sheet Name": sheet_name,
+                    "Issue Type": "SHEET_NO_NOT_FOUND",
+                    "Message": "LINE NO 끝에서 시트번호를 찾지 못해 ISO NO에 시트번호를 붙이지 못했습니다.",
+                    "Row No": r,
+                    "Source Start Row": r,
+                    "Source End Row": r,
+                    "LINE NO": current_header["LINE NO"],
+                    "ISO NO": current_header["ISO NO"],
+                    "Item Name": "",
+                    "Row Snapshot": a,
+                })
 
             if current_header["Excluded"] == "Y":
                 excluded_headers.append({
