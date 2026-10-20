@@ -15,11 +15,15 @@
   - COMMENT 에 두께(예: 'thickness shall be 50mm')가 하나만 적혀 있으면 이미 그 두께인 품목에는 적지 않음
 
 결과 파일 모양
-  - O열 머리글 'Comment' (N열 Note 머리글과 같은 서식), COMMENT 행은 노란색 음영
-  - COMMENT 가 있는 행만 보이게 필터를 건 채로 저장 (필터를 풀면 전체가 보임), '기본' 보기
+  - O열 머리글 'Comment' (N열 Note 머리글과 같은 서식, 노란색), COMMENT 행과 그 품목의 라인 머리글 행
+    (Pipeline / Трубопровод - ...)은 노란색 음영
+  - 노란색 행만 보이게 필터(O열 색 기준)를 건 채로 저장 (필터를 풀면 전체가 보임), '기본' 보기
   원본 파일의 다른 내용(서식, 그림, 머리글/바닥글 등)은 그대로 둔다.
 """
 from pathlib import Path
+import bisect
+import functools
+import html
 import os
 import posixpath
 import re
@@ -48,8 +52,8 @@ OUTPUT_SUFFIX = "_COMMENT"           # 결과 파일명: 원래이름_COMMENT.xl
 COMMENT_COLUMN = "O"                 # TI-LST 에 COMMENT 를 적을 열 (N열 Note 바로 오른쪽)
 COMMENT_HEADER = "Comment"           # COMMENT 열 머리글 (N열 머리글과 같은 서식). "" 이면 머리글 안 적음
 COMMENT_COLUMN_WIDTH = 40            # COMMENT 열 너비. None 이면 원본 너비 그대로
-HIGHLIGHT_COLOR = "FFFFFF00"         # COMMENT 행(A~O열) 음영 색 (ARGB, 노란색). None 이면 음영 없음
-FILTER_COMMENT_ROWS = True           # True: COMMENT 가 있는 행만 보이게 필터를 건 채로 저장
+HIGHLIGHT_COLOR = "FFFFFF00"         # 음영 색 (ARGB, 노란색): COMMENT 행·라인 머리글 행(A~O열)·Comment 머리글
+FILTER_COMMENT_ROWS = True           # True: COMMENT 행과 그 라인 머리글 행만 보이게 필터를 건 채로 저장
 NORMAL_VIEW = True                   # True: '기본' 보기로 저장 (페이지 나누기 미리 보기를 풀어 보기 쉽게)
 SKIP_SAME_THICKNESS = True           # True: COMMENT 의 두께(예: 50mm)와 이미 같은 두께인 품목에는 안 적음
 APPEND_FORMAT = "{comment}"          # 데이터 끝에 추가하는 COMMENT 형식 (예: "{iso} / {line} / DN {dn}: {comment}")
@@ -213,13 +217,19 @@ def requested_thickness(comment):
     return round(values.pop(), 1) if len(values) == 1 else None
 
 
+@functools.lru_cache(maxsize=None)
+def attr_re(name):
+    """속성 name="값" 을 찾는 정규식 (이름 끝만 같은 다른 속성은 제외)"""
+    return re.compile(rf'(?<![\w:.-]){name}\s*=\s*(["\'])(.*?)\1', re.S)
+
+
 def get_attr(attrs, name):
-    m = re.search(rf'(?<![\w:.-]){name}\s*=\s*(["\'])(.*?)\1', attrs, re.S)
+    m = attr_re(name).search(attrs)
     return m.group(2) if m else None
 
 
 def set_attr(attrs, name, value):
-    m = re.search(rf'(?<![\w:.-]){name}\s*=\s*(["\'])(.*?)\1', attrs, re.S)
+    m = attr_re(name).search(attrs)
     if m:
         return f"{attrs[:m.start(2)]}{value}{attrs[m.end(2):]}"
     return f'{attrs} {name}="{value}"'
@@ -251,16 +261,37 @@ def read_rels(zf, part):
 
 
 def find_parts(zf, sheet_name):
-    """{'workbook', 'styles', 'sheet': XML 경로, 'index': 시트 순번(0부터)}"""
+    """{'workbook', 'styles', 'strings', 'sheet': XML 경로, 'index': 시트 순번(0부터)}"""
     workbook = next(path for kind, path in read_rels(zf, "").values() if kind.endswith("/officeDocument"))
     rels = read_rels(zf, workbook)
     styles = next((path for kind, path in rels.values() if kind.endswith("/styles")), None)
+    strings = next((path for kind, path in rels.values() if kind.endswith("/sharedStrings")), None)
     sheets = [s for s in ET.fromstring(zf.read(workbook)).iter() if s.tag.split("}")[-1] == "sheet"]
     for index, sheet in enumerate(sheets):
         if sheet.get("name") == sheet_name:
             rel_id = next(v for k, v in sheet.attrib.items() if k.endswith("}id"))
-            return {"workbook": workbook, "styles": styles, "sheet": rels[rel_id][1], "index": index}
+            return {"workbook": workbook, "styles": styles, "strings": strings, "sheet": rels[rel_id][1],
+                    "index": index}
     raise ValueError(f"시트를 찾지 못했습니다: {sheet_name}")
+
+
+def read_shared_strings(zf, path):
+    """공유 문자열 목록 (칸 글자를 읽을 때 씀). 공유 문자열 파일이 없으면 []"""
+    try:
+        root = ET.fromstring(zf.read(path)) if path else ()
+    except KeyError:
+        return []
+    strings = []
+    for si in root:
+        parts = []
+        for child in si:
+            tag = child.tag.split("}")[-1]
+            if tag == "t":
+                parts.append(child.text or "")
+            elif tag == "r":  # 서식 있는 글자 조각
+                parts += [t.text or "" for t in child if t.tag.split("}")[-1] == "t"]
+        strings.append("".join(parts))
+    return strings
 
 
 def decode_xml(data):
@@ -283,6 +314,9 @@ class SheetXml:
         self.row_re = re.compile(rf"<{p}row\b([^>]*?)(/>|>(.*?)</{p}row>)", re.S)
         self.cell_re = re.compile(rf"<{p}c\b([^>]*?)(/>|>.*?</{p}c>)", re.S)
         self.value_re = re.compile(rf"<{p}(?:v|is|f)\b")
+        self.v_re = re.compile(rf"<{p}v(?:\s[^>]*)?>(.*?)</{p}v>", re.S)
+        self.t_re = re.compile(rf"<{p}t(?:\s[^>]*)?(?<!/)>(.*?)</{p}t>", re.S)
+        self._rows = None
         if m.group(2):  # <sheetData/>
             self.head, self.body, self.tail = sheet_xml[:m.start()], "", sheet_xml[m.end():]
             self.open_tag, self.close_tag = f"<{self.prefix}sheetData>", f"</{self.prefix}sheetData>"
@@ -292,12 +326,14 @@ class SheetXml:
             self.open_tag = self.close_tag = ""
 
     def rows(self):
-        """(행 번호, 매치) - r 이 없는 행은 앞 행 + 1"""
-        current = 0
-        for rm in self.row_re.finditer(self.body):
-            r = get_attr(rm.group(1), "r")
-            current = int(r) if r else current + 1
-            yield current, rm
+        """[(행 번호, 매치)] - r 이 없는 행은 앞 행 + 1 (본문을 고치기 전까지 한 번만 찾음)"""
+        if self._rows is None:
+            self._rows, current = [], 0
+            for rm in self.row_re.finditer(self.body):
+                r = get_attr(rm.group(1), "r")
+                current = int(r) if r else current + 1
+                self._rows.append((current, rm))
+        return self._rows
 
     def cells(self, body):
         """(열 번호, 매치) - r 이 없는 칸은 앞 칸 + 1"""
@@ -322,6 +358,27 @@ class SheetXml:
                             filled.add(row_no)
                         break
         return last, filled
+
+    def column_texts(self, col, strings):
+        """{행: col 열 칸의 글자} (공유 문자열·인라인 문자열·값)"""
+        texts = {}
+        for row_no, rm in self.rows():
+            for c, cm in self.cells(rm.group(3) or ""):
+                if c == col:
+                    texts[row_no] = self.cell_text(cm, strings)
+                if c >= col:
+                    break
+        return texts
+
+    def cell_text(self, cm, strings):
+        kind, body = get_attr(cm.group(1), "t"), cm.group(2)
+        if kind == "inlineStr":
+            return html.unescape("".join(self.t_re.findall(body)))
+        v = self.v_re.search(body)
+        value = html.unescape(v.group(1)).strip() if v else ""
+        if kind == "s":
+            return strings[int(value)] if value.isdigit() and int(value) < len(strings) else ""
+        return value
 
     def col_styles(self, max_col):
         """열 기본 서식 {열: 서식 번호} (<cols> 의 style)"""
@@ -442,6 +499,7 @@ class SheetXml:
         pieces.append(self.body[pos:])
         pieces += [missing_row(n) for n in range(prev + 1, max([last, *edits, 0]) + 1)]
         self.body = "".join(pieces)
+        self._rows = None
 
     def mirror_merges(self, src_col, dst_col, max_row):
         """머리글 줄(max_row 까지)에서 src_col 만 세로로 병합된 범위를 dst_col 에도 똑같이 병합"""
@@ -460,11 +518,14 @@ class SheetXml:
             self.tail = (self.tail[:m.start()] + f"{start}>{m.group(2)}{''.join(new)}</{self.prefix}mergeCells>"
                          + self.tail[m.end():])
 
-    def set_autofilter(self, ref, col_id):
-        """ref 범위에 필터를 걸고 col_id 열(0부터)은 '비어 있지 않음'으로 (필터를 건 상태로 저장)"""
+    def set_autofilter(self, ref, col_id, dxf_id=None):
+        """ref 범위에 필터를 건다 (필터를 건 상태로 저장). col_id 열(0부터) 조건: dxf_id 가 있으면 그 색(셀 채우기)
+        기준, 없으면 '비어 있지 않음'"""
         p = self.prefix
-        new = (f'<{p}autoFilter ref="{ref}"><{p}filterColumn colId="{col_id}"><{p}customFilters>'
-               f'<{p}customFilter operator="notEqual" val=" "/></{p}customFilters></{p}filterColumn></{p}autoFilter>')
+        criteria = (f'<{p}colorFilter dxfId="{dxf_id}"/>' if dxf_id is not None else
+                    f'<{p}customFilters><{p}customFilter operator="notEqual" val=" "/></{p}customFilters>')
+        new = (f'<{p}autoFilter ref="{ref}"><{p}filterColumn colId="{col_id}">{criteria}</{p}filterColumn>'
+               f'</{p}autoFilter>')
         m = re.search(rf"<{self.p}autoFilter\b[^>]*?(?:/>|>.*?</{self.p}autoFilter>)", self.tail, re.S)
         if m:
             self.tail = self.tail[:m.start()] + new + self.tail[m.end():]
@@ -540,7 +601,7 @@ class SheetXml:
 
 
 class StylesXml:
-    """styles.xml 에 음영 채우기와, 그 채우기만 바꾼 셀 서식(원래 서식 복사)을 덧붙인다."""
+    """styles.xml 에 음영 채우기와, 그 채우기만 바꾼 셀 서식(원래 서식 복사), 색 기준 필터용 서식을 덧붙인다."""
 
     def __init__(self, styles_xml):
         self.xml = styles_xml
@@ -554,6 +615,16 @@ class StylesXml:
         self.fill_id = len(re.findall(rf"<{p}fill\b", (fills.group(2) or "") if fills else ""))
         self.xfs = re.findall(rf"<{p}xf\b[^>]*?(?:/>|>.*?</{p}xf>)", (xfs.group(2) or "") if xfs else "", re.S)
         self.new_xfs, self.cache = [], {}
+        self.dxfs_re = re.compile(rf"(<{p}dxfs\b[^>]*?)(?:/>|>(.*?)</{p}dxfs>)", re.S)
+        dxfs = self.dxfs_re.search(styles_xml)
+        self.dxf_count = len(re.findall(rf"<{p}dxf\b", (dxfs.group(2) or "") if dxfs else ""))
+        self.filter_dxf = None
+
+    def color_filter_dxf(self):
+        """색 기준 필터에 쓸 차등 서식(dxf) 번호 - 음영 색. styles.xml 을 못 고치면 None"""
+        if self.ok and self.filter_dxf is None:
+            self.filter_dxf = self.dxf_count
+        return self.filter_dxf
 
     def highlighted(self, style):
         """style 서식에서 채우기만 음영으로 바꾼 서식 번호"""
@@ -578,6 +649,18 @@ class StylesXml:
         m = self.xfs_re.search(xml)
         xml = (xml[:m.start()] + f"{set_attr(m.group(1), 'count', len(self.xfs) + len(self.new_xfs))}>"
                f"{m.group(2) or ''}{''.join(self.new_xfs)}</{p}cellXfs>" + xml[m.end():])
+        if self.filter_dxf is not None:
+            dxf = (f'<{p}dxf><{p}fill><{p}patternFill patternType="solid"><{p}fgColor rgb="{HIGHLIGHT_COLOR}"/>'
+                   f'<{p}bgColor rgb="{HIGHLIGHT_COLOR}"/></{p}patternFill></{p}fill></{p}dxf>')
+            m = self.dxfs_re.search(xml)
+            if m:
+                xml = (xml[:m.start()] + f"{set_attr(m.group(1), 'count', self.dxf_count + 1)}>{m.group(2) or ''}"
+                       f"{dxf}</{p}dxfs>" + xml[m.end():])
+            else:  # dxfs 가 없으면 cellStyles(없으면 cellXfs) 바로 뒤에 만듦
+                e = re.escape(p)
+                m = (re.search(rf"</{e}cellStyles>|<{e}cellStyles\b[^>]*/>", xml)
+                     or re.search(rf"</{e}cellXfs>|<{e}cellXfs\b[^>]*/>", xml))
+                xml = xml[:m.end()] + f'<{p}dxfs count="1">{dxf}</{p}dxfs>' + xml[m.end():]
         return xml
 
 
@@ -605,6 +688,18 @@ def set_filter_database(workbook_xml, sheet_index, sheet_name, ref):
                                f"<{prefix}definedNames>{new}</{prefix}definedNames>")
 
 
+def line_header_rows(sheet, strings, item_rows):
+    """품목 행마다 바로 위에 있는 라인 머리글 행(A열 'Pipeline / Трубопровод - ...') 번호"""
+    headers = sorted(row for row, text in sheet.column_texts(1, strings).items()
+                     if row > HEADER_ROWS and ti.is_pipeline_header(text))
+    found = set()
+    for row in item_rows:
+        i = bisect.bisect_left(headers, row)
+        if i:
+            found.add(headers[i - 1])
+    return found
+
+
 def existing_values(path, sheet_name, col):
     """원본 TI-LST 의 COMMENT 열에 이미 있는 값 {행: 값}"""
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
@@ -618,8 +713,8 @@ def existing_values(path, sheet_name, col):
 
 
 def write_ti_comments(src, sheet_name, out_path, row_texts, append_texts):
-    """원본 TI-LST 를 복사하며 COMMENT 를 넣는다. 머리글 'Comment', COMMENT 행 음영, COMMENT 행만 보이는 필터,
-    기본 보기까지 설정하고, 바뀐 XML(시트·서식·통합 문서)만 바꿔 저장한다 (그림·머리글/바닥글 등은 그대로).
+    """원본 TI-LST 를 복사하며 COMMENT 를 넣는다. 머리글 'Comment', COMMENT 행·라인 머리글 행 음영, 그 행만 보이는
+    필터, 기본 보기까지 설정하고, 바뀐 XML(시트·서식·통합 문서)만 바꿔 저장한다 (그림·머리글/바닥글 등은 그대로).
 
     row_texts: {품목 행: [COMMENT...]} / append_texts: 데이터 끝 다음 행부터 차례로 적을 글자
     돌려주는 값: ({품목 행: 기존 값 있었는지}, [추가한 행 번호])"""
@@ -644,38 +739,49 @@ def write_ti_comments(src, sheet_name, out_path, row_texts, append_texts):
         values.update(zip(appended, append_texts))
         last = max(last_row, max(values, default=0))
 
-        # COMMENT 칸 + 행 음영 (원래 서식에 채우기만 바꿈)
-        header_rows = range(1, HEADER_ROWS + 1)
-        cells = sheet.cell_styles(set(values) | (set(header_rows) if COMMENT_HEADER else set()), col)
         styles = None
         if HIGHLIGHT_COLOR and parts["styles"]:
             styles_xml, styles_encoding = decode_xml(zin.read(parts["styles"]))
             styles = StylesXml(styles_xml)
+        # 어느 라인인지 알 수 있게 COMMENT 품목의 라인 머리글 행(Pipeline / Трубопровод - ...)도 음영·보이게
+        marked = set(values)
+        if row_texts and (styles or FILTER_COMMENT_ROWS):
+            marked |= line_header_rows(sheet, read_shared_strings(zin, parts["strings"]), row_texts)
+
+        # COMMENT 칸 + 행 음영 (원래 서식에 채우기만 바꿈)
+        header_rows = range(1, HEADER_ROWS + 1)
+        cells = sheet.cell_styles(marked | (set(header_rows) if COMMENT_HEADER else set()), col)
         edits = defaultdict(dict)
-        for row, text in values.items():
-            row_styles = cells[row][0]
-            for c in (range(1, col + 1) if styles else [col]):
-                style = styles.highlighted(row_styles[c]) if styles else row_styles[c]
-                edits[row][c] = (style, text if c == col else None)
-        # 머리글: N열(Note)과 같은 서식, N열 이름이 있는 줄에 'Comment' (N열이 병합돼 있으면 똑같이 병합)
+        for row in marked:
+            row_styles, text = cells[row][0], values.get(row)
+            if styles:
+                for c in range(1, col + 1):
+                    edits[row][c] = (styles.highlighted(row_styles[c]), text if c == col else None)
+            elif text is not None:
+                edits[row][col] = (row_styles[col], text)
+        # 머리글: N열(Note)과 같은 서식 + 음영, N열 이름이 있는 줄에 'Comment' (N열이 병합돼 있으면 똑같이 병합)
         if COMMENT_HEADER:
             note = col - 1
             name_row = next((r for r in header_rows if note in cells[r][1]), HEADER_ROWS)
             for r in header_rows:
-                edits[r][col] = (cells[r][0][note], COMMENT_HEADER if r == name_row else None)
+                style = cells[r][0][note]
+                if styles and r >= name_row:
+                    style = styles.highlighted(style)
+                edits[r][col] = (style, COMMENT_HEADER if r == name_row else None)
             sheet.mirror_merges(note, col, HEADER_ROWS)
 
-        sheet.rewrite(edits, (HEADER_ROWS + 1, last, set(values)) if FILTER_COMMENT_ROWS else None)
+        sheet.rewrite(edits, (HEADER_ROWS + 1, last, marked) if FILTER_COMMENT_ROWS else None)
         sheet.widen_dimension(col, last)
-        if FILTER_COMMENT_ROWS:
-            sheet.set_autofilter(f"A{HEADER_ROWS}:{letter}{last}", col - 1)
+        if FILTER_COMMENT_ROWS:  # 음영이 있으면 O열 노란색 기준 필터 (필터 단추에서 확인을 눌러도 같은 행이 보임)
+            sheet.set_autofilter(f"A{HEADER_ROWS}:{letter}{last}", col - 1,
+                                 styles.color_filter_dxf() if styles else None)
         if COMMENT_COLUMN_WIDTH:
             sheet.set_column_width(col, COMMENT_COLUMN_WIDTH)
         if NORMAL_VIEW:
             sheet.normal_view()
 
         replaced = {parts["sheet"]: sheet.text().encode(sheet_encoding)}
-        if styles and styles.new_xfs:
+        if styles and (styles.new_xfs or styles.filter_dxf is not None):
             replaced[parts["styles"]] = styles.text().encode(styles_encoding)
         if FILTER_COMMENT_ROWS:
             workbook_xml, workbook_encoding = decode_xml(zin.read(parts["workbook"]))
