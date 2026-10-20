@@ -552,6 +552,7 @@ def parse_insulation_workbook(file_path):
 # EHT LIST 한 행(ISO 시트 + DN)을 TI 의 같은 ISO 시트(시트번호 붙은 ISO NO) + DN 품목과 비교한다.
 # 길이는 파이프(Pipe/Труба/Tube)만, 밸브는 수량으로 두께별 합계를 낸다. (엘보/티/리듀서는 DN 이 없어 제외)
 # TI Note 에 전기히팅 표시가 있는 품목이 있으면 그 품목만 비교한다. (EHT 길이는 히팅 구간 기준)
+# 'TI 최소 두께' 는 비교한 TI 파이프·밸브 중 가장 얇은 두께 (EHT 에 보수적으로 반영할 값 = 열손실이 가장 큰 경우)
 EHT_STATUSES = [  # (판정, 설명) - EHT비교요약 시트 순서
     ("일치", "TI 파이프·밸브 두께가 모두 EHT 두께와 같고, 길이 차이도 {tol:g}m 이내"),
     ("길이 차이", "두께는 같지만 EHT 길이와 TI 파이프 길이가 {tol:g}m 넘게 차이 남"),
@@ -564,12 +565,19 @@ EHT_STATUSES = [  # (판정, 설명) - EHT비교요약 시트 순서
     ("비교 제외", "Pumping Trap, DN이 숫자 하나가 아님(40x20 등), ISO/두께 없음, 길이·밸브 0이고 TI에 DN 없음"),
 ]
 
+EHT_TEMP_STATUSES = [  # (온도 판정, 설명) - 두께를 비교한 행(일치/길이 차이/두께 혼재/두께 불일치)만
+    ("일치", "TI 온도가 EHT Operation Temp 와 같음 ('0.5 ~ 25' 는 범위 안, '37 / 290' 은 둘 중 하나와 같으면 일치)"),
+    ("다름", "TI 온도가 EHT Operation Temp 와 다름"),
+    ("비교 불가", "EHT 온도가 AMB 처럼 숫자가 아니거나 TI 온도가 없음"),
+]
+
 EHT_REPORT_COLUMNS = [
     "판정", "내용",
     "ISO NO", "DN", "EHT 라인", "EHT 배관재질", "EHT 보온구분", "EHT Remark",
-    "EHT 두께 (mm)", "EHT 길이 (m)", "EHT 밸브 (ea)",
+    "EHT 두께 (mm)", "TI 최소 두께 (mm)", "두께 변경 필요", "EHT 길이 (m)", "EHT 밸브 (ea)",
     "TI 파이프 두께별 길이", "TI 파이프 길이 (m)", "TI 중 EHT 두께 길이 (m)", "EHT 두께 비율 (%)", "길이 차이 (m)",
     "TI 밸브 두께별 수량", "TI 밸브 (ea)",
+    "EHT 운전온도 (℃)", "TI 온도 (°C)", "온도 판정",
     "TI LINE NO", "TI 보온구분", "TI 파일",
     "EHT 파일", "EHT 행",
 ]
@@ -585,6 +593,7 @@ EHT_FIELD_KEYWORDS = [  # (항목, 머리글 글자) - 2줄 머리글을 합쳐 
     ("Valve", ("valve",)),
     ("Pipe Material", ("pipe material",)),
     ("Insulation", ("insulation material", "material")),
+    ("Operation Temp", ("operation temp", "operating temp")),
     ("Remark", ("remark",)),
     ("ID", ("piping number", "equipment")),
 ]
@@ -636,11 +645,11 @@ def line_tokens(text):
     return {t for t in re.split(r"[-/\s()]+", clean_text(text).upper()) if t}
 
 
-def thk_order(thk):
-    """두께 정렬: 숫자 -> 숫자가 아닌 글자(예: '30+30') -> 빈칸"""
-    if isinstance(thk, float):
-        return (0, thk, "")
-    return (1, 0, thk) if thk else (2, 0, "")
+def value_order(value):
+    """두께/온도 정렬: 숫자 -> 숫자가 아닌 글자(예: '30+30') -> 빈칸"""
+    if isinstance(value, float):
+        return (0, value, "")
+    return (1, 0, value) if value else (2, 0, "")
 
 
 def thk_label(thk):
@@ -652,7 +661,7 @@ def thk_label(thk):
 def by_thk_text(amounts, unit):
     """{두께: 양} -> '20mm 2.00m, 30mm 1.00m' (두께 순)"""
     fmt = "{:.2f}m" if unit == "m" else "{:g}ea"
-    return ", ".join(f"{thk_label(thk)} {fmt.format(amounts[thk])}" for thk in sorted(amounts, key=thk_order))
+    return ", ".join(f"{thk_label(thk)} {fmt.format(amounts[thk])}" for thk in sorted(amounts, key=value_order))
 
 
 def pipe_valve_text(pipe, valve):
@@ -661,6 +670,39 @@ def pipe_valve_text(pipe, valve):
     if valve:
         parts.append("밸브 " + by_thk_text(valve, "ea"))
     return ", ".join(parts)
+
+
+def distinct_temps(entries):
+    """TI 품목 온도 목록 (숫자 먼저, 중복 없이)"""
+    return sorted({e["temp"] for e in entries if e["temp"] is not None}, key=value_order)
+
+
+def temp_ranges(value):
+    """EHT 온도 -> [(최소, 최대)]. '70' -> [(70, 70)], '0.5 ~ 25' -> [(0.5, 25)],
+    '37 / 290' -> [(37, 37), (290, 290)]. AMB 처럼 숫자가 아니면 None."""
+    num = to_number(value)
+    if num is not None:
+        return [(num, num)]
+    ranges = []
+    for part in clean_text(value).replace("℃", "").replace("°C", "").split("/"):
+        m = re.fullmatch(r"\s*(-?\d+(?:[.,]\d+)?)\s*~\s*(-?\d+(?:[.,]\d+)?)\s*", part)
+        if m:
+            ranges.append(tuple(sorted((to_number(m.group(1)), to_number(m.group(2))))))
+            continue
+        num = to_number(part)
+        if num is None:
+            return None
+        ranges.append((num, num))
+    return ranges
+
+
+def compare_temp(eht_temp, ti_temps):
+    """EHT Operation Temp 와 TI 온도 비교 -> '일치' / '다름' / '비교 불가'"""
+    ranges = temp_ranges(eht_temp)
+    numbers = [t for t in ti_temps if isinstance(t, float)]
+    if not ranges or not numbers or len(numbers) < len(ti_temps):
+        return "비교 불가"
+    return "일치" if all(any(lo <= t <= hi for lo, hi in ranges) for t in numbers) else "다름"
 
 
 def find_eht_columns(head):
@@ -736,6 +778,7 @@ def build_ti_groups(all_items):
         is_valve = "valve" in rec["Item Name"].lower()
         thk_text = rec["Insulation Thickness (mm)"] or rec["Insulation Detail Thickness (mm)"]
         thk = to_number(thk_text)
+        temp = to_number(rec["Temperature (°C)"])
         qty = to_number(rec["Qty"])
         m_type = INSULATION_TYPE_RE.search(rec["Line Header"])
         groups[(iso, dn)].append({
@@ -745,6 +788,7 @@ def build_ti_groups(all_items):
             "file": rec["Source File"],
             "valve": is_valve,
             "thk": round(thk, 1) if thk is not None else (thk_text or None),  # 숫자가 아니면 글자 그대로
+            "temp": round(temp, 1) if temp is not None else (rec["Temperature (°C)"] or None),
             "length": 0.0 if is_valve else (to_number(rec["Length/Height (m)"]) or 0.0),
             "qty": (1.0 if qty is None else qty) if is_valve else 0.0,
             "excluded": rec["Excluded"] == "Y",
@@ -761,11 +805,14 @@ def summarize_ti(entries):
             valve[e["thk"]] += e["qty"]
         else:
             pipe[e["thk"]] += e["length"]
+    numeric_thks = [t for t in list(pipe) + list(valve) if isinstance(t, float)]
     columns = {
+        "TI 최소 두께 (mm)": tidy_number(min(numeric_thks)) if numeric_thks else None,
         "TI 파이프 두께별 길이": by_thk_text(pipe, "m"),
         "TI 파이프 길이 (m)": tidy_number(sum(pipe.values())),
         "TI 밸브 두께별 수량": by_thk_text(valve, "ea"),
         "TI 밸브 (ea)": tidy_number(sum(valve.values())),
+        "TI 온도 (°C)": ", ".join(f"{t:g}" if isinstance(t, float) else t for t in distinct_temps(entries)),
         "TI LINE NO": ", ".join(dict.fromkeys(e["line"] for e in entries)),
         "TI 보온구분": ", ".join(dict.fromkeys(e["type"] for e in entries if e["type"])),
         "TI 파일": ", ".join(dict.fromkeys(e["file"] for e in entries)),
@@ -844,7 +891,7 @@ def compare_eht_row(row, iso, dn, groups, ti_iso_dns, split, out):
     thks = set(pipe) | set(valve)
     if thk not in thks:
         status = "두께 불일치"
-        notes.insert(0, "TI 두께: " + ", ".join(thk_label(t) for t in sorted(thks, key=thk_order)))
+        notes.insert(0, "TI 두께: " + ", ".join(thk_label(t) for t in sorted(thks, key=value_order)))
     elif len(thks) > 1:
         status = "두께 혼재"
         other_pipe = {t: v for t, v in pipe.items() if t != thk}
@@ -859,6 +906,12 @@ def compare_eht_row(row, iso, dn, groups, ti_iso_dns, split, out):
         notes.append(f"길이 TI {ti_length:.2f}m vs EHT {length:g}m")
     if ti_valves != round(valves, 3):
         notes.append(f"밸브 TI {ti_valves:g}ea vs EHT {valves:g}ea")
+
+    # EHT 두께가 TI 최소 두께(가장 얇은 = 열손실이 가장 큰 경우)와 다르면 TI 최소 두께로 반영해야 함
+    ti_min = columns["TI 최소 두께 (mm)"]
+    if ti_min is not None:
+        out["두께 변경 필요"] = "Y" if float(ti_min) != thk else "N"
+    out["온도 판정"] = compare_temp(row.get("Operation Temp"), distinct_temps(active))
     return status, notes
 
 
@@ -888,6 +941,7 @@ def compare_eht(eht_rows, all_items):
             "EHT 배관재질": row.get("Pipe Material"), "EHT 보온구분": row.get("Insulation"),
             "EHT Remark": row.get("Remark"), "EHT 두께 (mm)": row.get("THK"),
             "EHT 길이 (m)": row.get("Length"), "EHT 밸브 (ea)": row.get("Valve"),
+            "EHT 운전온도 (℃)": row.get("Operation Temp"),
             "EHT 파일": row["EHT 파일"], "EHT 행": row["EHT 행"],
         })
         status, notes = compare_eht_row(row, iso, dn, groups, ti_iso_dns, eht_keys[(iso, dn)] > 1, out)
@@ -913,9 +967,16 @@ def compare_eht(eht_rows, all_items):
                for status, desc in EHT_STATUSES]
     summary.append({"판정": "합계", "건수": len(report),
                     "설명": f"EHT LIST {len(eht_rows)}행 + EHT에 없음 {counts['EHT에 없음']}건"})
+    summary.append({"판정": "두께 변경 필요", "건수": sum(rec["두께 변경 필요"] == "Y" for rec in report),
+                    "설명": "EHT 두께가 TI 최소 두께와 다름 → TI 최소 두께(가장 얇은 = 열손실 최대)로 반영"})
+    temp_counts = Counter(rec["온도 판정"] for rec in report if rec["온도 판정"])
+    summary.extend({"판정": f"온도 {status}", "건수": temp_counts[status], "설명": desc}
+                   for status, desc in EHT_TEMP_STATUSES)
     summary.append({"판정": "비교 기준", "설명": (
         "ISO 시트(ISO NO + 시트번호)와 DN이 같은 TI 파이프(길이)·밸브(수량)의 보온 두께와 비교. "
-        "TI Note에 전기히팅 표시가 있는 품목이 있으면 그 품목만 비교. 엘보/티/리듀서는 DN이 없어 제외.")})
+        "TI Note에 전기히팅 표시가 있는 품목이 있으면 그 품목만 비교. 엘보/티/리듀서는 DN이 없어 제외. "
+        "TI 최소 두께 = 비교한 TI 파이프·밸브 중 가장 얇은 두께. "
+        "온도는 EHT Operation Temp 와 TI Temperature 비교.")})
     return report, summary
 
 
