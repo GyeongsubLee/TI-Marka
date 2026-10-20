@@ -26,6 +26,7 @@ import zipfile
 from collections import defaultdict
 from datetime import datetime
 from multiprocessing import freeze_support
+from xml.parsers.expat import ParserCreate
 
 import openpyxl
 from openpyxl.utils import column_index_from_string, get_column_letter
@@ -131,23 +132,51 @@ def comment_targets(rec, groups, known_files):
     return picked
 
 
-def choose_append_file(iso, file_isos):
-    """붙일 품목이 없는 COMMENT 를 적을 TI 파일: 그 ISO 시트가 있는 파일,
+def ti_groups(items):
+    """ti_lst_reader 의 비교용 묶음 {(ISO 시트, DN): [TI 품목]}. 품목마다 원본 행 번호('row')를 붙여 돌려준다.
+
+    예전 ti_lst_reader.py 는 'row' 를 넣지 않으므로, 같은 순서·같은 조건으로 묶은 품목의 행 번호를 붙인다."""
+    groups, _ = ti.build_ti_groups(items)
+    if all("row" in e for entries in groups.values() for e in entries):
+        return groups
+    rows = defaultdict(list)
+    for rec in items:
+        iso = ti.normalize_iso(rec.get("ISO NO"))
+        dn = ti.dn_number(rec.get("Nominal Diameter")) if iso else None
+        if dn is not None:
+            rows[(iso, dn)].append(rec["Source Start Row"])
+    for key, entries in groups.items():
+        if len(entries) != len(rows[key]):
+            raise RuntimeError("ti_lst_reader.py 버전이 맞지 않습니다. "
+                               "이 프로그램과 같이 받은 ti_lst_reader.py 로 바꿔 주세요.")
+        for e, row in zip(entries, rows[key]):
+            e["row"] = row
+    return groups
+
+
+class AppendFiles:
+    """붙일 품목이 없는 COMMENT 를 적을 TI 파일 찾기: 그 ISO 시트가 있는 파일,
     없으면 같은 구역(ISO 번호 앞부분이 같은) 파일 중 ISO 번호가 가장 가까운 파일."""
-    exact = sorted(name for name, isos in file_isos.items() if iso in isos)
-    if exact:
-        return exact[0]
-    m = ISO_SERIAL_RE.match(iso or "")
-    if not m:
-        return None
-    base, serial = m.group(1), int(m.group(2))
-    best = None
-    for name in sorted(file_isos):
-        distances = [abs(int(k.group(2)) - serial) for k in map(ISO_SERIAL_RE.match, file_isos[name])
-                     if k and k.group(1) == base]
-        if distances and (best is None or min(distances) < best[0]):
-            best = (min(distances), name)
-    return best[1] if best else None
+
+    def __init__(self, file_isos):
+        self.exact = {}                   # ISO 시트 -> 파일 (파일명 순으로 첫 파일)
+        self.by_base = defaultdict(list)  # '...-TKM-ISO' -> [(ISO 번호, 파일)]
+        for name in sorted(file_isos):
+            for iso in file_isos[name]:
+                self.exact.setdefault(iso, name)
+                m = ISO_SERIAL_RE.match(iso)
+                if m:
+                    self.by_base[m.group(1)].append((int(m.group(2)), name))
+
+    def choose(self, iso):
+        if iso in self.exact:
+            return self.exact[iso]
+        m = ISO_SERIAL_RE.match(iso or "")
+        candidates = self.by_base.get(m.group(1)) if m else None
+        if not candidates:
+            return None
+        serial = int(m.group(2))
+        return min(candidates, key=lambda c: (abs(c[0] - serial), c[1]))[1]
 
 
 # =========================
@@ -189,9 +218,8 @@ def decode_xml(data):
 class SheetXml:
     """시트 XML 에서 sheetData 의 행 위치를 찾아 칸을 넣는다 (정규식으로 필요한 곳만 고침)."""
 
-    def __init__(self, xml):
-        self.xml = xml
-        m = re.search(r"<(\w+:)?sheetData\b[^>]*?(/?)>", xml)
+    def __init__(self, sheet_xml):
+        m = re.search(r"<(\w+:)?sheetData\b[^>]*?(/?)>", sheet_xml)
         if not m:
             raise ValueError("sheetData 가 없습니다")
         self.prefix = m.group(1) or ""
@@ -200,11 +228,11 @@ class SheetXml:
         self.cell_re = re.compile(rf"<{p}c\b([^>]*?)(/>|>.*?</{p}c>)", re.S)
         self.value_re = re.compile(rf"<{p}(?:v|is|f)\b")
         if m.group(2):  # <sheetData/>
-            self.head, self.body, self.tail = xml[:m.start()], "", xml[m.end():]
+            self.head, self.body, self.tail = sheet_xml[:m.start()], "", sheet_xml[m.end():]
             self.open_tag, self.close_tag = f"<{self.prefix}sheetData>", f"</{self.prefix}sheetData>"
         else:
-            end = xml.index(f"</{self.prefix}sheetData>", m.end())
-            self.head, self.body, self.tail = xml[:m.end()], xml[m.end():end], xml[end:]
+            end = sheet_xml.index(f"</{self.prefix}sheetData>", m.end())
+            self.head, self.body, self.tail = sheet_xml[:m.end()], sheet_xml[m.end():end], sheet_xml[end:]
             self.open_tag = self.close_tag = ""
 
     def rows(self):
@@ -215,13 +243,29 @@ class SheetXml:
             current = int(r.group(1)) if r else current + 1
             yield current, rm
 
-    def last_value_row(self):
-        """값이 들어 있는 마지막 행 번호 (모든 열 기준)"""
-        last = 0
+    def cells(self, body):
+        """(열 번호, 매치) - r 이 없는 칸은 앞 칸 + 1"""
+        current = 0
+        for cm in self.cell_re.finditer(body):
+            ref = re.search(r'\br\s*=\s*["\']([A-Za-z]+)\d+["\']', cm.group(1))
+            current = column_index_from_string(ref.group(1).upper()) if ref else current + 1
+            yield current, cm
+
+    def scan(self, col, check_rows):
+        """(값이 들어 있는 마지막 행 번호(모든 열 기준), check_rows 중 col 칸에 이미 값이 있는 행)"""
+        last, filled = 0, set()
         for row_no, rm in self.rows():
-            if rm.group(3) and self.value_re.search(rm.group(3)):
-                last = row_no
-        return last
+            body = rm.group(3)
+            if not body or not self.value_re.search(body):
+                continue
+            last = row_no
+            if row_no in check_rows:
+                for c, cm in self.cells(body):
+                    if c >= col:
+                        if c == col and self.value_re.search(cm.group(0)):
+                            filled.add(row_no)
+                        break
+        return last, filled
 
     def cell(self, ref, style, text):
         p = self.prefix
@@ -231,16 +275,13 @@ class SheetXml:
 
     def row_with_cell(self, attrs, body, row_no, col, text):
         """행 안의 col 칸을 text 로 (있으면 서식 유지하고 바꾸고, 없으면 열 순서에 맞게 끼워 넣음)"""
-        current = 0
         replace = insert_at = None
-        cells = list(self.cell_re.finditer(body))
-        for cm in cells:
-            ref = re.search(r'\br\s*=\s*["\']([A-Za-z]+)\d+["\']', cm.group(1))
-            current = column_index_from_string(ref.group(1).upper()) if ref else current + 1
-            if current == col:
+        cells = list(self.cells(body))
+        for c, cm in cells:
+            if c == col:
                 replace = cm
                 break
-            if current > col:
+            if c > col:
                 insert_at = cm.start()
                 break
         style = ""
@@ -251,7 +292,7 @@ class SheetXml:
         if replace:
             body = body[:replace.start()] + new_cell + body[replace.end():]
         else:
-            at = insert_at if insert_at is not None else (cells[-1].end() if cells else 0)
+            at = insert_at if insert_at is not None else (cells[-1][1].end() if cells else 0)
             body = body[:at] + new_cell + body[at:]
 
         # spans(선택 속성)가 새 칸을 포함하지 않으면 지움
@@ -326,24 +367,27 @@ def write_ti_comments(src, sheet_name, out_path, row_texts, append_texts):
     row_texts: {품목 행: [COMMENT...]} / append_texts: 데이터 끝 다음 행부터 차례로 적을 글자
     돌려주는 값: ({품목 행: 기존 값 있었는지}, [추가한 행 번호])"""
     col = column_index_from_string(COMMENT_COLUMN)
-    old = existing_values(src, sheet_name, col) if row_texts else {}
-    values, had_old = {}, {}
-    for row, texts in row_texts.items():
-        text = " / ".join(dict.fromkeys(texts))
-        before = comment_text(old.get(row))
-        had_old[row] = bool(before) and text not in before
-        values[row] = f"{before} / {text}" if had_old[row] else (before or text)
-
     with zipfile.ZipFile(src) as zin:
         part = find_sheet_part(zin, sheet_name)
-        xml, encoding = decode_xml(zin.read(part))
-        sheet = SheetXml(xml)
-        first = max(sheet.last_value_row(), max(values, default=0)) + 1  # 원본 데이터가 끝난 다음 행
+        sheet_xml, encoding = decode_xml(zin.read(part))
+        sheet = SheetXml(sheet_xml)
+        last_row, filled = sheet.scan(col, set(row_texts))
+
+        # 품목 행의 COMMENT 열에 원래 값이 있으면 그 뒤에 붙임 (값이 있는 행이 있을 때만 다시 읽음)
+        old = existing_values(src, sheet_name, col) if filled else {}
+        values, had_old = {}, {}
+        for row, texts in row_texts.items():
+            text = " / ".join(dict.fromkeys(texts))
+            before = comment_text(old.get(row))
+            had_old[row] = bool(before) and text not in before
+            values[row] = f"{before} / {text}" if had_old[row] else (before or text)
+
+        first = max(last_row, max(values, default=0)) + 1  # 원본 데이터가 끝난 다음 행
         appended = list(range(first, first + len(append_texts)))
         values.update(zip(appended, append_texts))
         sheet.set_cells(col, values)
         new_data = sheet.text().encode(encoding)
-        ET.fromstring(new_data)  # 고친 XML 이 깨지지 않았는지 확인 (깨졌으면 여기서 오류 -> 저장 안 함)
+        ParserCreate().Parse(new_data, True)  # 고친 XML 이 깨지지 않았는지 확인 (깨졌으면 오류 -> 저장 안 함)
 
         # 다른 파일(서식, 그림, 공유 문자열 등)은 원본 그대로 복사하고 시트 XML 만 바꿈
         tmp_path = out_path.with_name(out_path.name + ".tmp")
@@ -377,9 +421,9 @@ def is_eht_list(path):
 def find_ti_files(base_dir, out_dir):
     """ti_lst_reader 와 같은 규칙으로 TI-LST 파일 찾기 (결과 폴더, COMMENT/EHT LIST 파일 제외)"""
     files = base_dir.rglob("*.xlsx") if ti.RECURSIVE else base_dir.glob("*.xlsx")
+    skip = [k.lower() for k in [*ti.SKIP_KEYWORDS, COMMENT_FILE_KEYWORD]]
     return sorted(f for f in files
-                  if not any(k.lower() in f.name.lower() for k in ti.SKIP_KEYWORDS) and out_dir not in f.parents
-                  and not is_eht_list(f))
+                  if not any(k in f.name.lower() for k in skip) and out_dir not in f.parents and not is_eht_list(f))
 
 
 def parse_ti_files(paths):
@@ -438,7 +482,7 @@ def main():
     print(f"TI-LST 읽는 중... (COMMENT 에 나온 파일 {len(first)}개)")
     items = parse_ti_files(first) if first else []
 
-    groups, _ = ti.build_ti_groups(items)
+    groups = ti_groups(items)
     targets = [comment_targets(rec, groups, by_name) for rec in comments]
     if any(not picked and not split_names(rec.get("TI 파일")) for rec, picked in zip(comments, targets)):
         rest = [f for f in ti_files if f.name not in named]
@@ -454,6 +498,7 @@ def main():
     for rec in items:
         if rec["ISO NO"]:
             file_isos[rec["Source File"]].add(ti.normalize_iso(rec["ISO NO"]))
+    append_files = AppendFiles(file_isos)
 
     # 3) 파일별로 적을 내용 모으기
     row_texts = defaultdict(lambda: defaultdict(list))   # 파일 -> 품목 행 -> [COMMENT]
@@ -475,7 +520,7 @@ def main():
                 continue
         else:
             iso = comment_iso(rec)
-            name = choose_append_file(iso, file_isos) if iso else None
+            name = append_files.choose(iso) if iso else None
             if name is None:
                 log.append(log_row("TI 파일 없음 (같은 구역 TI-LST 를 찾지 못함)", rec))
                 continue

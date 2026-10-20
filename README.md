@@ -113,6 +113,8 @@ TI 최소 두께 `20`, 두께 변경 필요 `Y`, 내용 `EHT 두께가 아닌 �
 - 어디에 적었는지는 `OUTPUT TI COMMENT/COMMENT_반영결과_날짜_시간.xlsx` 에 남습니다 (적지 못한 COMMENT 와 이유 포함).
 - TI 품목은 결과 파일을 만들 때와 같은 규칙으로 다시 찾습니다. 그 사이 TI-LST 가 바뀌었으면 결과 파일을 다시 만든 뒤
   COMMENT 를 적으세요.
+- `ti_lst_reader.py` 를 같은 폴더에 두어야 합니다 (예전 버전이어도 동작하지만 같이 받은 최신 버전으로 바꿔 두세요).
+- 처리 시간: TI-LST 100개, COMMENT 2,200건 기준 약 15초
 - 설정(파일 위쪽): `COMMENT_FILE_KEYWORD`, `OUTPUT_FOLDER`, `OUTPUT_SUFFIX`, `COMMENT_COLUMN`(기본 `O`),
   `APPEND_FORMAT`(데이터 끝에 추가할 때 형식)
 
