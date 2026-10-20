@@ -42,9 +42,14 @@ EHT LIST 엑셀을 TI-LST 파일들과 **같은 폴더**에 넣고 실행하면 
 
 - 파일명에 `EHT` 가 들어가야 합니다 (예: `EHT LIST.xlsx`). 이 파일은 TI-LST 로 처리하지 않습니다.
 - 머리글에 `ISO NUMBER`, `Nominal Diameter`, `Thickness` 가 있는 시트를 찾아 읽습니다.
-  2줄 병합 머리글, 위쪽 제목 행이 있어도 됩니다. 나머지 열(Length, No. of Valve, material, Operation Temp, Remark 등)도
+  여러 줄 병합 머리글, 위쪽 제목 행이 있어도 됩니다. 나머지 열(Length, No. of Valve, material, Operation Temp, Remark 등)도
   머리글 글자로 찾습니다.
+  - 그런 시트가 여럿이면 찾은 열이 가장 많은 시트를 읽습니다.
+  - 같은 머리글 열이 여럿이면 앞의 열을 쓰되, 값이 하나도 없는 열은 건너뜁니다.
 - 두께가 VLOOKUP 같은 수식이면 엑셀에 저장된 계산 값을 읽습니다.
+- **어느 시트·열을 읽었는지** 실행 화면(`읽은 열: ...`)과 EHT비교요약 시트의 `EHT 열 위치` 줄에 나옵니다.
+  열을 못 찾았거나 값이 모두 비어 있으면(예: 수식의 계산 값이 저장되어 있지 않음) 그 이유도 함께 나오고
+  에러로그에 `EHT_COLUMN_CHECK` 로 남습니다.
 
 ### 비교 방법
 

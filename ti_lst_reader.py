@@ -4,11 +4,12 @@ import os
 import re
 import time
 import traceback
+import unicodedata
 import zipfile
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
-from itertools import chain, islice, zip_longest
+from itertools import islice, zip_longest
 from multiprocessing import freeze_support
 import warnings
 
@@ -568,7 +569,7 @@ EHT_STATUSES = [  # (판정, 설명) - EHT비교요약 시트 순서
 EHT_TEMP_STATUSES = [  # (온도 판정, 설명) - 두께를 비교한 행(일치/길이 차이/두께 혼재/두께 불일치)만
     ("일치", "TI 온도가 EHT Operation Temp 와 같음 ('0.5 ~ 25' 는 범위 안, '37 / 290' 은 둘 중 하나와 같으면 일치)"),
     ("다름", "TI 온도가 EHT Operation Temp 와 다름"),
-    ("비교 불가", "EHT 온도가 AMB 처럼 숫자가 아니거나 TI 온도가 없음"),
+    ("비교 불가", "EHT 온도가 AMB·빈칸처럼 숫자가 아니거나 TI 온도가 없음 (온도 열을 못 찾으면 'EHT 열 위치' 확인)"),
 ]
 
 EHT_REPORT_COLUMNS = [
@@ -585,20 +586,26 @@ EHT_REPORT_COLUMNS = [
 EHT_SUMMARY_COLUMNS = ["판정", "건수", "설명"]
 
 EHT_HEADER_SCAN_ROWS = 30  # 머리글('ISO NUMBER')을 찾을 시트 위쪽 행 수
-EHT_FIELD_KEYWORDS = [  # (항목, 머리글 글자) - 2줄 머리글을 합쳐 소문자로 비교, 위에서부터 차례로 열을 정함
-    ("ISO", ("iso number", "iso no")),
-    ("DN", ("nominal diameter",)),
-    ("THK", ("thickness", "thk")),
-    ("Length", ("length",)),
-    ("Valve", ("valve",)),
-    ("Pipe Material", ("pipe material",)),
-    ("Insulation", ("insulation material", "material")),
-    ("Operation Temp", ("operation temp", "operating temp")),
-    ("Remark", ("remark",)),
-    ("ID", ("piping number", "equipment")),
+EHT_FIELDS = [  # (항목, 안내용 이름, 머리글 글자) - 여러 줄 머리글을 합쳐 소문자로 비교, 위 항목·앞 글자부터 열을 정함
+    ("ISO", "ISO NUMBER", ("iso number", "iso no")),
+    ("DN", "Nominal Diameter", ("nominal diameter",)),
+    ("THK", "Thickness", ("thickness", "thk")),
+    ("Length", "Length", ("length",)),
+    ("Valve", "No. of Valve", ("valve",)),
+    ("Pipe Material", "pipe material", ("pipe material",)),
+    ("Insulation", "Insulation material", ("insulation material", "material")),
+    ("Operation Temp", "Operation Temp",  # ("oper", "temp") 처럼 묶은 글자는 둘 다 들어 있으면 맞음
+     ("operation temp", "operating temp", "oper. temp", "운전온도", ("oper", "temp"), ("운전", "온도"))),
+    ("Remark", "Piping Remark", ("remark",)),
+    ("ID", "Equipment/piping number", ("piping number", "equipment")),
 ]
 EHT_REQUIRED_FIELDS = ("ISO", "DN", "THK")
-EHT_SUBHEADER_WORDS = ("nominal diameter", "thickness", "length", "material")
+EHT_CHECK_FIELDS = {  # 열이 없거나 값이 비어 있으면 알려줄 항목 -> 못 하게 되는 비교
+    "ISO": "비교 안 됨", "DN": "비교 안 됨", "THK": "비교 안 됨",
+    "Length": "길이 비교 안 됨", "Valve": "밸브 수량 비교 안 됨",
+    "Insulation": "INDOOR/OUTDOOR 구분 안 됨", "Operation Temp": "온도 비교 안 됨",
+}
+EHT_SUBHEADER_WORDS = ("nominal diameter", "thickness", "length", "material", "temp")
 HEATING_NOTES = ("there is electric heating", "имеется электрообогрев")
 INSULATION_TYPE_RE = re.compile(r"\b([A-Z]{1,3})\s*\(\s*([A-Z]{3,})\s*\)")  # H(OUTDOOR), H(REGEN) 등
 
@@ -705,60 +712,141 @@ def compare_temp(eht_temp, ti_temps):
     return "일치" if all(any(lo <= t <= hi for lo, hi in ranges) for t in numbers) else "다름"
 
 
+def header_text(value):
+    """머리글 비교용 글자: 전각 문자·특수 공백·보이지 않는 문자를 정리하고 소문자로 ('ISO  NUMBER' -> 'iso number')"""
+    text = unicodedata.normalize("NFKC", clean_text(value))
+    return " ".join("".join(ch for ch in text if unicodedata.category(ch) != "Cf").lower().split())
+
+
+def is_header_row(row, iso_col):
+    """머리글 바로 아래 줄도 머리글인지: 머리글 글자가 있거나, 숫자 칸이 없고 ISO 칸이 비어 있으면(병합) 머리글"""
+    texts = [header_text(v) for v in row]
+    if any(word in t for t in texts for word in EHT_SUBHEADER_WORDS):
+        return True
+    has_number = any(isinstance(v, (int, float)) and not isinstance(v, bool) for v in row)
+    return not has_number and not (texts[iso_col] if iso_col < len(texts) else "")
+
+
 def find_eht_columns(head):
-    """EHT LIST 머리글을 찾아 ({항목: 열 번호}, 데이터 시작 위치)를 돌려준다. 없으면 None."""
+    """EHT LIST 머리글을 찾아 ({항목: [후보 열 번호]}, 머리글 첫 줄, 데이터 시작 위치, 열별 머리글)을 돌려준다.
+    없으면 None."""
     for idx, row in enumerate(head):
-        labels = [clean_text(v).lower() for v in row]
-        if not any("iso number" in t or "iso no" in t for t in labels):
+        labels = [header_text(v) for v in row]
+        iso_cols = [col for col, t in enumerate(labels) if "iso number" in t or "iso no" in t]
+        if not iso_cols:
             continue
 
-        # 2줄 머리글(병합)이면 아래 행 글자도 합침: 'Insulation' + 'material', 'Detail of pipe' + 'Length (m)'
+        # 여러 줄 머리글(병합)이면 아래 줄 글자도 합침: 'Insulation' + 'material', 'Process data' + 'Operation Temp (℃)'
         start = idx + 1
-        while start < len(head) and start - idx < 3:
-            sub = [clean_text(v).lower() for v in head[start]]
-            if not any(word in t for t in sub for word in EHT_SUBHEADER_WORDS):
-                break
+        while start < len(head) and start - idx <= 3 and is_header_row(head[start], iso_cols[0]):
+            sub = [header_text(v) for v in head[start]]
             labels = [f"{a} {b}".strip() for a, b in zip_longest(labels, sub, fillvalue="")]
             start += 1
 
-        cols = {}
-        for field, words in EHT_FIELD_KEYWORDS:
-            for col, label in enumerate(labels):
-                if col not in cols.values() and any(word in label for word in words):
-                    cols[field] = col
-                    break
-        if all(field in cols for field in EHT_REQUIRED_FIELDS):
-            if "ID" not in cols and 0 not in cols.values():
-                cols["ID"] = 0  # 첫 열 = Equipment/piping number
-            return cols, start
+        candidates = {}
+        for field, _, words in EHT_FIELDS:
+            found = [col for word in words for col, label in enumerate(labels)
+                     if (all(w in label for w in word) if isinstance(word, tuple) else word in label)]
+            if found:
+                candidates[field] = list(dict.fromkeys(found))
+        if all(field in candidates for field in EHT_REQUIRED_FIELDS):
+            return candidates, idx, start, labels
     return None
+
+
+def formula_columns(file_path, sheet_name, data_start, columns):
+    """값이 비어 있는 열 중 수식이 들어 있는 열 (수식의 계산 값이 파일에 저장되지 않은 경우)"""
+    wb = openpyxl.load_workbook(file_path, read_only=True, data_only=False)
+    try:
+        ws = wb[sheet_name]
+        ws.reset_dimensions()
+        found = set()
+        for row in islice(ws.iter_rows(values_only=True), data_start, None):
+            found.update(col for col in columns
+                         if col < len(row) and isinstance(row[col], str) and row[col].startswith("="))
+            if found == set(columns):
+                break
+        return found
+    finally:
+        wb.close()
 
 
 def read_eht_list(file_path):
-    """EHT LIST 데이터 행을 읽는다. 'ISO NUMBER' 머리글이 있는 시트가 없으면 None (= EHT LIST 아님)."""
+    """EHT LIST 를 읽어 (데이터 행, 읽은 정보)를 돌려준다.
+    'ISO NUMBER' 머리글이 있는 시트가 없으면 None (= EHT LIST 아님).
+
+    머리글이 맞는 시트가 여럿이면 찾은 항목이 가장 많은 시트를 읽는다.
+    같은 머리글 열이 여럿이면 앞의 열을 쓰되, 값이 하나도 없는 열은 건너뛴다.
+    """
     wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)  # VLOOKUP 등 수식은 계산된 값으로 읽음
     try:
+        best = None
         for ws in wb.worksheets:
             ws.reset_dimensions()
-            rows = ws.iter_rows(values_only=True)
-            head = [list(row) for row in islice(rows, EHT_HEADER_SCAN_ROWS)]
+            head = [list(row) for row in islice(ws.iter_rows(values_only=True), EHT_HEADER_SCAN_ROWS)]
             found = find_eht_columns(head)
-            if not found:
-                continue
-
-            cols, data_start = found
-            records = []
-            for row_no, row in enumerate(chain(head[data_start:], rows), start=data_start + 1):
-                rec = {"EHT 파일": file_path.name, "EHT 행": row_no}
-                for field, col in cols.items():
-                    value = row[col] if col < len(row) else None
-                    rec[field] = clean_text(value) if isinstance(value, str) else value
-                if any(rec.get(field) not in (None, "") for field in ("ID", "DN", "ISO")):
-                    records.append(rec)
-            return records
+            if found and (best is None or len(found[0]) > len(best[1][0])):
+                best = (ws, found)
+        if best is None:
+            return None
+        ws, (candidates, header_row, data_start, labels) = best
+        sheet_name = ws.title
+        data = [list(row) for row in islice(ws.iter_rows(values_only=True), data_start, None)]
     finally:
         wb.close()
-    return None
+
+    def has_values(col):
+        return any(col < len(row) and row[col] not in (None, "") for row in data)
+
+    cols = {}
+    for field, _, _ in EHT_FIELDS:
+        options = [col for col in candidates.get(field, []) if col not in cols.values()]
+        if options:
+            cols[field] = next((col for col in options if has_values(col)), options[0])
+    if "ID" not in cols and 0 not in cols.values():
+        cols["ID"] = 0  # 첫 열 = Equipment/piping number
+
+    records = []
+    for row_no, row in enumerate(data, start=data_start + 1):
+        rec = {"EHT 파일": file_path.name, "EHT 행": row_no}
+        for field, col in cols.items():
+            value = row[col] if col < len(row) else None
+            rec[field] = clean_text(value) if isinstance(value, str) else value
+        if any(rec.get(field) not in (None, "") for field in ("ID", "DN", "ISO")):
+            records.append(rec)
+
+    empty = [field for field in EHT_CHECK_FIELDS if field in cols and not has_values(cols[field])]
+    formulas = formula_columns(file_path, sheet_name, data_start, [cols[f] for f in empty]) if empty else set()
+    info = {
+        "file": file_path.name,
+        "sheet": sheet_name,
+        "header_rows": f"{header_row + 1}~{data_start}행" if data_start - header_row > 1 else f"{data_start}행",
+        "columns": {field: get_column_letter(col + 1) for field, col in cols.items()},
+        "missing": [field for field in EHT_CHECK_FIELDS if field not in cols],
+        "empty": empty,
+        "formula": [field for field in empty if cols[field] in formulas],
+        "labels": labels,
+    }
+    return records, info
+
+
+def eht_column_text(info):
+    """'EHT LIST.xlsx' 'EHT LIST' 시트 1~2행: ISO NUMBER=Q, Nominal Diameter=C, ..."""
+    names = {field: name for field, name, _ in EHT_FIELDS}
+    columns = ", ".join(f"{names[field]}={letter}" for field, letter in info["columns"].items())
+    return f"{info['file']} '{info['sheet']}' 시트, 머리글 {info['header_rows']}: {columns}"
+
+
+def eht_column_problems(info):
+    """EHT LIST 에서 찾지 못했거나 값이 비어 있는 열 안내 문구"""
+    names = {field: name for field, name, _ in EHT_FIELDS}
+    problems = [f"'{names[field]}' 열을 찾지 못함 → {EHT_CHECK_FIELDS[field]}" for field in info["missing"]]
+    for field in info["empty"]:
+        where = f"'{names[field]}' 열({info['columns'][field]}열) 값이 모두 비어 있음"
+        if field in info["formula"]:
+            where += " - 수식의 계산 값이 파일에 저장되어 있지 않음 (엑셀에서 열어 저장한 뒤 다시 실행)"
+        problems.append(f"{where} → {EHT_CHECK_FIELDS[field]}")
+    return problems
 
 
 def build_ti_groups(all_items):
@@ -915,8 +1003,9 @@ def compare_eht_row(row, iso, dn, groups, ti_iso_dns, split, out):
     return status, notes
 
 
-def compare_eht(eht_rows, all_items):
-    """EHT LIST 각 행을 같은 ISO 시트·DN 의 TI 두께/길이와 비교한다. (비교 행, 요약 행)을 돌려준다."""
+def compare_eht(eht_rows, all_items, eht_infos=()):
+    """EHT LIST 각 행을 같은 ISO 시트·DN 의 TI 두께/길이와 비교한다. (비교 행, 요약 행)을 돌려준다.
+    eht_infos: read_eht_list 가 돌려준 읽은 정보 (요약 시트에 EHT 열 위치를 적음)"""
     groups, ti_iso_dns = build_ti_groups(all_items)
 
     prepared = []
@@ -977,6 +1066,9 @@ def compare_eht(eht_rows, all_items):
         "TI Note에 전기히팅 표시가 있는 품목이 있으면 그 품목만 비교. 엘보/티/리듀서는 DN이 없어 제외. "
         "TI 최소 두께 = 비교한 TI 파이프·밸브 중 가장 얇은 두께. "
         "온도는 EHT Operation Temp 와 TI Temperature 비교.")})
+    for info in eht_infos:
+        problems = eht_column_problems(info)
+        summary.append({"판정": "EHT 열 위치", "설명": eht_column_text(info) + "".join(f" / !! {p}" for p in problems)})
     return report, summary
 
 
@@ -1359,11 +1451,12 @@ def main():
     # EHT LIST: 파일명에 EHT_FILE_KEYWORD 가 있고 'ISO NUMBER' 머리글이 있으면 TI-LST 대신 EHT LIST 로 읽음
     eht_files = []
     eht_rows = []
+    eht_infos = []
     for f in sorted(target_files):
         if not EHT_FILE_KEYWORD or EHT_FILE_KEYWORD.lower() not in f.name.lower():
             continue
         try:
-            rows = read_eht_list(f)
+            result = read_eht_list(f)
         except Exception as e:
             errors.append({
                 "Source File": f.name, "Source Path": str(f), "Sheet Name": "",
@@ -1373,10 +1466,21 @@ def main():
             print(f"!! EHT LIST 읽기 오류: {f.name} ({e})")
             target_files.remove(f)
             continue
-        if rows is not None:
-            eht_files.append(f)
-            eht_rows.extend(rows)
-            print(f"EHT LIST: {f.name} ({len(rows)}행)")
+        if result is None:
+            continue
+        rows, info = result
+        eht_files.append(f)
+        eht_rows.extend(rows)
+        eht_infos.append(info)
+        print(f"EHT LIST: {f.name} ({len(rows)}행)")
+        print(f"  읽은 열: {eht_column_text(info)}")
+        for problem in eht_column_problems(info):  # 못 찾은 열/빈 열은 화면과 에러로그에 남김
+            print(f"  !! {problem}")
+            errors.append({
+                "Source File": f.name, "Source Path": str(f), "Sheet Name": info["sheet"],
+                "Issue Type": "EHT_COLUMN_CHECK", "Message": problem,
+                "Row Snapshot": " | ".join(info["labels"]),
+            })
     target_files = [f for f in target_files if f not in eht_files]
 
     print(f"검색된 xlsx 파일 수: {len(files)}")
@@ -1397,7 +1501,7 @@ def main():
     eht_summary = []
     if eht_files:
         print("EHT LIST 비교 중...")
-        eht_report, eht_summary = compare_eht(eht_rows, all_items)
+        eht_report, eht_summary = compare_eht(eht_rows, all_items, eht_infos)
         eht_sheets = [
             ("EHT비교요약", eht_summary, EHT_SUMMARY_COLUMNS),
             ("EHT비교", eht_report, EHT_REPORT_COLUMNS),
