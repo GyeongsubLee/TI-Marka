@@ -106,17 +106,31 @@ TI 최소 두께 `20`, 두께 변경 필요 `Y`, 내용 `EHT 두께가 아닌 �
 | EHT비교 행 | TI-LST 에 적는 곳 (O열) |
 |---|---|
 | TI 와 비교한 행 (일치, 길이 차이, 두께 혼재/불일치, TI 제외라인, EHT에 없음) | 비교에 쓴 TI 품목(같은 ISO 시트·DN 의 파이프·밸브)의 품목 행. 엘보/티/리듀서에는 적지 않음 |
-| 붙일 품목이 없는 행 (TI에 ISO 없음, TI에 DN 없음 등) | 그 ISO 시트가 있는 TI-LST, 없으면 같은 구역에서 ISO 번호가 가장 가까운 TI-LST 의 **데이터가 끝난 다음 행부터** 차례로 `ISO NO / 라인 / DN: COMMENT` |
+| 붙일 품목이 없는 행 (TI에 ISO 없음, TI에 DN 없음 등) | 그 ISO 시트가 있는 TI-LST, 없으면 같은 구역에서 ISO 번호가 가장 가까운 TI-LST 의 **데이터가 끝난 다음 행부터** 차례로 적은 COMMENT 그대로 |
 
 - 같은 품목에 COMMENT 가 여러 개면 ` / ` 로 이어 붙이고, 원본 O열에 이미 값이 있으면 그 뒤에 붙입니다.
-- TI-LST 의 다른 내용(서식, 병합, 그림, 머리글/바닥글, 인쇄 영역 등)은 그대로 두고 O열 칸만 넣습니다.
-- 어디에 적었는지는 `OUTPUT TI COMMENT/COMMENT_반영결과_날짜_시간.xlsx` 에 남습니다 (적지 못한 COMMENT 와 이유 포함).
+- COMMENT 에 두께가 하나만 적혀 있으면(예: `thickness shall be 50mm`, `Thk 50`, `두께 50`) **이미 그 두께인 품목에는
+  적지 않습니다**. 예) 두께 혼재 행에서 파이프 50mm·밸브 40mm 이면 밸브에만 적음.
+  두께가 여러 개 적혀 있으면(예: `40 -> 50mm`) 모든 품목에 적습니다. 끄려면 `SKIP_SAME_THICKNESS = False`.
+- 어디에 적었는지는 `OUTPUT TI COMMENT/COMMENT_반영결과_날짜_시간.xlsx` 에 남습니다
+  (적지 못한 COMMENT 와 이유, 이미 같은 두께라 `적지 않음 (이미 50mm)` 인 품목 포함).
+
+결과 파일 모양
+
+- O열 머리글 `Comment` (N열 Note 머리글과 같은 서식, N열이 2~3행 병합이면 O열도 병합), O열 너비 40 이상
+- COMMENT 를 적은 행(품목 행·추가한 행)은 A~O열 노란색 음영 (원래 글꼴·테두리는 그대로)
+- **COMMENT 가 있는 행만 보이게 필터를 건 채로** 저장됩니다. 전체를 보려면 O열(3행) 필터 단추에서 필터 해제
+  (데이터 → 지우기)
+- 보기는 `기본` (페이지 나누기 미리 보기였어도 기본 보기로 바꿈)
+- 그 밖의 내용(서식, 병합, 그림, 머리글/바닥글, 인쇄 영역 등)은 원본 그대로입니다.
 - TI 품목은 결과 파일을 만들 때와 같은 규칙으로 다시 찾습니다. 그 사이 TI-LST 가 바뀌었으면 결과 파일을 다시 만든 뒤
   COMMENT 를 적으세요.
 - `ti_lst_reader.py` 를 같은 폴더에 두어야 합니다 (예전 버전이어도 동작하지만 같이 받은 최신 버전으로 바꿔 두세요).
-- 처리 시간: TI-LST 100개, COMMENT 2,200건 기준 약 15초
+- 처리 시간: TI-LST 100개, COMMENT 2,200건 기준 약 18초
 - 설정(파일 위쪽): `COMMENT_FILE_KEYWORD`, `OUTPUT_FOLDER`, `OUTPUT_SUFFIX`, `COMMENT_COLUMN`(기본 `O`),
-  `APPEND_FORMAT`(데이터 끝에 추가할 때 형식)
+  `COMMENT_HEADER`(머리글), `COMMENT_COLUMN_WIDTH`(O열 너비), `HIGHLIGHT_COLOR`(음영 색, `None` 이면 음영 없음),
+  `FILTER_COMMENT_ROWS`(필터), `NORMAL_VIEW`(기본 보기), `SKIP_SAME_THICKNESS`(같은 두께 품목 제외),
+  `APPEND_FORMAT`(데이터 끝에 추가할 때 형식, 기본은 COMMENT 만. 예: `"{iso} / {line} / DN {dn}: {comment}"`)
 
 ## Nominal Diameter(DN) 지정 규칙
 
