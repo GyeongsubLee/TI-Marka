@@ -6,6 +6,7 @@
 ## 사용법
 
 1. `ti_lst_reader.py` 를 TI-LST 파일들이 있는 폴더에 넣고 실행합니다 (더블클릭 또는 `python ti_lst_reader.py`).
+   (EHT비교 COMMENT 를 TI-LST 에 옮기는 `ti_comment_writer.py` 도 같은 폴더에 둡니다)
 2. 같은 폴더에 결과 파일이 만들어집니다. 시트: 통합정리데이터 / 파일별요약 / 제외라인목록 / 에러로그
    (EHT LIST 를 같이 넣었으면 뒤에 EHT비교요약 / EHT비교 시트가 추가됩니다)
 
@@ -15,7 +16,7 @@
 | 설정 | 설명 |
 |---|---|
 | `RECURSIVE` | 하위 폴더까지 검색할지 여부 |
-| `SKIP_KEYWORDS` | 파일명에 이 단어가 있으면 제외 (결과 파일·임시 파일) |
+| `SKIP_KEYWORDS` | 파일명에 이 단어가 있으면 제외 (결과 파일·임시 파일·COMMENT 파일, 대소문자 구분 안 함) |
 | `MAX_WORKERS` | 동시에 처리할 프로세스 수 (0: 자동 = CPU 코어 수, 최대 8 / 1: 병렬 처리 안 함) |
 | `EHT_FILE_KEYWORD` | 파일명에 이 글자(기본 `EHT`)가 있는 EHT LIST 를 TI-LST 대신 비교용으로 읽음 |
 | `EHT_LENGTH_TOLERANCE` | EHT 길이와 TI 파이프 길이 차이 허용값 (기본 0.1m) |
@@ -92,6 +93,28 @@ TI 최소 두께 `20`, 두께 변경 필요 `Y`, 내용 `EHT 두께가 아닌 �
 | EHT 운전온도 (℃) / TI 온도 (°C) / 온도 판정 | EHT Operation Temp, TI 온도(여럿이면 `20, 25`), `일치` / `다름` / `비교 불가` |
 | 내용 | 판정 이유, 비교에서 뺀 품목, 길이·밸브 수량 차이 |
 | EHT 행 | EHT LIST 파일의 행 번호 |
+| COMMENT (AC열) | 비어 있음. 여기 적은 코멘트를 `ti_comment_writer.py` 가 TI-LST 에 옮겨 적음 (아래) |
+
+## COMMENT 를 TI-LST 에 옮기기 (`ti_comment_writer.py`)
+
+1. 결과 파일 `EHT비교` 시트의 맨 끝 `COMMENT` 열(AC)에 코멘트를 적습니다.
+2. 파일명에 `COMMENT` 가 들어가게 저장합니다 (예: `EHT비교_COMMENT.xlsx`). 그 시트만 따로 저장해도 되고,
+   코멘트를 적은 행만 남겨도 됩니다.
+3. 그 파일을 TI-LST 파일들이 있는 폴더(`ti_lst_reader.py` 와 같은 폴더)에 넣고 `ti_comment_writer.py` 를 실행합니다.
+4. `OUTPUT TI COMMENT` 폴더에 `원래이름_COMMENT.xlsx` 가 만들어집니다. 원본 TI-LST 는 바뀌지 않습니다.
+
+| EHT비교 행 | TI-LST 에 적는 곳 (O열) |
+|---|---|
+| TI 와 비교한 행 (일치, 길이 차이, 두께 혼재/불일치, TI 제외라인, EHT에 없음) | 비교에 쓴 TI 품목(같은 ISO 시트·DN 의 파이프·밸브)의 품목 행. 엘보/티/리듀서에는 적지 않음 |
+| 붙일 품목이 없는 행 (TI에 ISO 없음, TI에 DN 없음 등) | 그 ISO 시트가 있는 TI-LST, 없으면 같은 구역에서 ISO 번호가 가장 가까운 TI-LST 의 **데이터가 끝난 다음 행부터** 차례로 `ISO NO / 라인 / DN: COMMENT` |
+
+- 같은 품목에 COMMENT 가 여러 개면 ` / ` 로 이어 붙이고, 원본 O열에 이미 값이 있으면 그 뒤에 붙입니다.
+- TI-LST 의 다른 내용(서식, 병합, 그림, 머리글/바닥글, 인쇄 영역 등)은 그대로 두고 O열 칸만 넣습니다.
+- 어디에 적었는지는 `OUTPUT TI COMMENT/COMMENT_반영결과_날짜_시간.xlsx` 에 남습니다 (적지 못한 COMMENT 와 이유 포함).
+- TI 품목은 결과 파일을 만들 때와 같은 규칙으로 다시 찾습니다. 그 사이 TI-LST 가 바뀌었으면 결과 파일을 다시 만든 뒤
+  COMMENT 를 적으세요.
+- 설정(파일 위쪽): `COMMENT_FILE_KEYWORD`, `OUTPUT_FOLDER`, `OUTPUT_SUFFIX`, `COMMENT_COLUMN`(기본 `O`),
+  `APPEND_FORMAT`(데이터 끝에 추가할 때 형식)
 
 ## Nominal Diameter(DN) 지정 규칙
 

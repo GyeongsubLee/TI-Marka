@@ -25,7 +25,7 @@ from openpyxl.utils import get_column_letter
 # 사용자 설정
 # =========================
 RECURSIVE = False   # True: 하위 폴더까지 검색 / False: 현재 폴더만 검색
-SKIP_KEYWORDS = ["가공본", "통합정리", "~$"]  # 결과물/임시파일 제외
+SKIP_KEYWORDS = ["가공본", "통합정리", "~$", "COMMENT"]  # 결과물/임시파일/COMMENT 파일 제외
 DATA_START_ROW = 5   # 실제 데이터 시작 추정 행
 VALIDATION_CHECK_MAX_COL = 14  # A:N 기준 검토 (이 열까지만 읽음)
 MAX_WORKERS = 0  # 동시에 처리할 프로세스 수 (0: 자동 = CPU 코어 수, 최대 8 / 1: 병렬 처리 안 함)
@@ -581,6 +581,7 @@ EHT_REPORT_COLUMNS = [
     "EHT 운전온도 (℃)", "TI 온도 (°C)", "온도 판정",
     "TI LINE NO", "TI 보온구분", "TI 파일",
     "EHT 파일", "EHT 행",
+    "COMMENT",  # 비워 둠: 여기 적은 COMMENT 를 ti_comment_writer.py 가 TI-LST 에 옮겨 적음
 ]
 
 EHT_SUMMARY_COLUMNS = ["판정", "건수", "설명"]
@@ -871,6 +872,7 @@ def build_ti_groups(all_items):
         m_type = INSULATION_TYPE_RE.search(rec["Line Header"])
         groups[(iso, dn)].append({
             "iso_text": rec["ISO NO"],
+            "row": rec["Source Start Row"],
             "line": rec["LINE NO"],
             "type": f"{m_type.group(1)}({m_type.group(2)})" if m_type else "",
             "file": rec["Source File"],
@@ -1439,7 +1441,7 @@ def main():
     target_files = []
     for f in files:
         name = f.name
-        if any(keyword in name for keyword in SKIP_KEYWORDS):
+        if any(keyword.lower() in name.lower() for keyword in SKIP_KEYWORDS):
             continue
         target_files.append(f)
 
