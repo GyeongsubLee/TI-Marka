@@ -871,7 +871,8 @@ def choose_heating_only(args):
     print("\nCOMMENT 를 어느 품목에 적을까요?")
     print("  1) TI Note 에 전기히팅 표시(There is electric heating / Имеется электрообогрев)가 있는 품목에만 (기본)")
     print("     - 한 라인에 히팅 구간과 아닌 구간이 섞여 있으면 히팅 구간만 적고, 히팅 표시 품목이 없으면 적지 않음")
-    print("  2) 비교한 품목 전체 (히팅 표시가 없는 품목, TI 품목이 없어 데이터 끝에 추가하는 COMMENT 포함)")
+    print("  2) 비교한 품목 전체 (히팅 표시가 없는 품목 포함)")
+    print("  (붙일 TI 품목이 없는 COMMENT(TI에 없는 라인)는 1, 2 모두 데이터 끝에 추가)")
     while True:
         try:
             answer = input("번호 입력 (엔터 = 1): ").strip()
@@ -924,9 +925,8 @@ def main():
 
     groups = ti_groups(items)
     targets = [comment_targets(rec, groups, by_name, heating_only) for rec in comments]
-    # 히팅 표시 품목에만 적을 때는 데이터 끝에 추가하는 COMMENT 가 없으므로 나머지 파일은 읽지 않음
-    if not heating_only and any(not picked and not split_names(rec.get("TI 파일"))
-                                for rec, (picked, _) in zip(comments, targets)):
+    if any(not picked and not no_heating and not split_names(rec.get("TI 파일"))
+           for rec, (picked, no_heating) in zip(comments, targets)):
         rest = [f for f in ti_files if f.name not in named]
         if rest:
             print(f"TI 파일이 없는 COMMENT(TI에 ISO 없음 등)가 있어 같은 구역 TI-LST 를 찾으려고 나머지도 읽습니다 "
@@ -963,10 +963,6 @@ def main():
                 row_comments[(e["file"], e["row"])].append(rec)
             continue
         if no_heating:
-            continue
-        if heating_only:  # 붙일 TI 품목이 없음 (TI에 ISO 없음 등) - 히팅 표시를 확인할 품목이 없으므로 적지 않음
-            log.append(log_row("적지 않음 (붙일 TI 품목 없음 - 전기히팅 표시 품목에만 적기)", rec,
-                               **{"TI 파일": ti.clean_text(rec.get("TI 파일"))}))
             continue
         # 붙일 품목이 없으면 데이터 끝에 추가: TI 파일이 적혀 있으면 그 파일, 없으면 같은 구역 파일
         names = split_names(rec.get("TI 파일"), by_name)
