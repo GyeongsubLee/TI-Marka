@@ -101,6 +101,13 @@ TI 최소 두께 `20`, 두께 변경 필요 `Y`, 내용 `EHT 두께가 아닌 �
 2. 파일명에 `COMMENT` 가 들어가게 저장합니다 (예: `EHT비교_COMMENT.xlsx`). 그 시트만 따로 저장해도 되고,
    코멘트를 적은 행만 남겨도 됩니다.
 3. 그 파일을 TI-LST 파일들이 있는 폴더(`ti_lst_reader.py` 와 같은 폴더)에 넣고 `ti_comment_writer.py` 를 실행합니다.
+   시작할 때 COMMENT 를 적을 품목을 고릅니다 (엔터 = 1).
+   - `1) 전기히팅 표시 품목에만` (기본): TI Note 에 `There is electric heating / Имеется электрообогрев` 가 있는
+     품목에만 적습니다. 한 라인에 히팅 구간과 아닌 구간이 섞여 있으면 **히팅 구간만** 적고, 히팅 표시 품목이 없으면
+     적지 않습니다.
+   - `2) 비교한 품목 전체`: 히팅 표시와 관계없이 비교한 품목 모두에 적습니다.
+   - 붙일 TI 품목이 없는 COMMENT(TI에 ISO 없음 등, TI에 없는 라인)는 1, 2 모두 **데이터 끝에 추가**합니다.
+   - 묻지 않게 하려면 실행할 때 `--heating` / `--all` 을 붙이거나 파일 위쪽 `COMMENT_SCOPE` 를 `"heating"` / `"all"` 로 둡니다.
 4. `OUTPUT TI COMMENT` 폴더에 `원래이름_COMMENT.xlsx` 가 만들어집니다. 원본 TI-LST 는 바뀌지 않습니다.
 
 | EHT비교 행 | TI-LST 에 적는 곳 (O열) |
@@ -113,7 +120,8 @@ TI 최소 두께 `20`, 두께 변경 필요 `Y`, 내용 `EHT 두께가 아닌 �
   적지 않습니다**. 예) 두께 혼재 행에서 파이프 50mm·밸브 40mm 이면 밸브에만 적음.
   두께가 여러 개 적혀 있으면(예: `40 -> 50mm`) 모든 품목에 적습니다. 끄려면 `SKIP_SAME_THICKNESS = False`.
 - 어디에 적었는지는 `OUTPUT TI COMMENT/COMMENT_반영결과_날짜_시간.xlsx` 에 남습니다
-  (적지 못한 COMMENT 와 이유, 이미 같은 두께라 `적지 않음 (이미 50mm)` 인 품목 포함).
+  (적지 못한 COMMENT 와 이유, 이미 같은 두께라 `적지 않음 (이미 50mm)` 인 품목,
+  히팅 표시가 없어 `적지 않음 (전기히팅 표시 없음)` 인 품목 포함).
   TI 품목마다 TI 도서의 품명·Size·DN·두께·`Length (m)`·`Volume of thermal insulation layer (m³)`·`Note` 도
   같이 나옵니다 (Length·체적은 숫자로 들어가서 엑셀에서 바로 합계를 낼 수 있음).
 
@@ -133,7 +141,7 @@ TI 최소 두께 `20`, 두께 변경 필요 `Y`, 내용 `EHT 두께가 아닌 �
 - 설정(파일 위쪽): `COMMENT_FILE_KEYWORD`, `OUTPUT_FOLDER`, `OUTPUT_SUFFIX`, `COMMENT_COLUMN`(기본 `O`),
   `COMMENT_HEADER`(머리글), `COMMENT_COLUMN_WIDTH`(O열 너비), `HIGHLIGHT_COLOR`(음영 색, `None` 이면 음영 없이
   O열 '비어 있지 않음' 필터), `FILTER_COMMENT_ROWS`(필터), `NORMAL_VIEW`(기본 보기),
-  `SKIP_SAME_THICKNESS`(같은 두께 품목 제외),
+  `SKIP_SAME_THICKNESS`(같은 두께 품목 제외), `COMMENT_SCOPE`(적을 품목: `None` 시작할 때 물어봄 / `"heating"` / `"all"`),
   `APPEND_FORMAT`(데이터 끝에 추가할 때 형식, 기본은 COMMENT 만. 예: `"{iso} / {line} / DN {dn}: {comment}"`)
 
 ## Nominal Diameter(DN) 지정 규칙
