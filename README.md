@@ -114,6 +114,8 @@ TI 최소 두께 `20`, 두께 변경 필요 `Y`, 내용 `EHT 두께가 아닌 �
   두께가 여러 개 적혀 있으면(예: `40 -> 50mm`) 모든 품목에 적습니다. 끄려면 `SKIP_SAME_THICKNESS = False`.
 - 어디에 적었는지는 `OUTPUT TI COMMENT/COMMENT_반영결과_날짜_시간.xlsx` 에 남습니다
   (적지 못한 COMMENT 와 이유, 이미 같은 두께라 `적지 않음 (이미 50mm)` 인 품목 포함).
+  TI 품목마다 TI 도서의 품명·Size·DN·두께·`Length (m)`·`Volume of thermal insulation layer (m³)`·`Note` 도
+  같이 나옵니다 (Length·체적은 숫자로 들어가서 엑셀에서 바로 합계를 낼 수 있음).
 
 결과 파일 모양
 

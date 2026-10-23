@@ -64,6 +64,7 @@ ISO_SERIAL_RE = re.compile(r"^(.*-ISO)-(\d+)(?:-\d{2})?$")     # ...-TKM-ISO-000
 
 LOG_COLUMNS = [
     "결과", "COMMENT", "TI 파일", "TI 행", "품명", "Size (mm)", "Nominal Diameter", "두께 (mm)",
+    "Length (m)", "Volume of thermal insulation layer (m³)", "Note",
     "LINE NO", "ISO NO", "DN", "판정", "EHT 라인", "COMMENT 파일", "COMMENT 행", "저장 파일",
 ]
 
@@ -839,11 +840,20 @@ def parse_ti_files(paths):
     return items
 
 
+def number_or_text(value):
+    """숫자로 읽히면 숫자('0,45' -> 0.45, 엑셀에서 합계를 낼 수 있게), 아니면 글자 그대로"""
+    num = ti.to_number(value)
+    return num if num is not None else value
+
+
 def item_info(item):
-    """반영 결과에 남길 TI 품목 정보"""
+    """반영 결과에 남길 TI 품목 정보 (TI 도서의 Length·보온층 체적·Note 포함)"""
     return {"TI 파일": item["Source File"], "TI 행": item["Source Start Row"], "품명": item["Item Name"],
             "Size (mm)": item["Size (mm)"], "Nominal Diameter": item["Nominal Diameter"],
-            "두께 (mm)": item["Insulation Thickness (mm)"], "LINE NO": item["LINE NO"]}
+            "두께 (mm)": item["Insulation Thickness (mm)"],
+            "Length (m)": number_or_text(item["Length/Height (m)"]),
+            "Volume of thermal insulation layer (m³)": number_or_text(item["Volume of Insulation Layer (m³)"]),
+            "Note": item["Note"], "LINE NO": item["LINE NO"]}
 
 
 def log_row(result, rec, **extra):
