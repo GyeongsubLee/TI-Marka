@@ -106,8 +106,12 @@ TI 최소 두께 `20`, 두께 변경 필요 `Y`, 내용 `EHT 두께가 아닌 �
      품목에만 적습니다. 한 라인에 히팅 구간과 아닌 구간이 섞여 있으면 **히팅 구간만** 적고, 히팅 표시 품목이 없으면
      적지 않습니다.
    - `2) 비교한 품목 전체`: 히팅 표시와 관계없이 비교한 품목 모두에 적습니다.
-   - 붙일 TI 품목이 없는 COMMENT(TI에 ISO 없음 등, TI에 없는 라인)는 1, 2 모두 **데이터 끝에 추가**합니다.
-   - 묻지 않게 하려면 실행할 때 `--heating` / `--all` 을 붙이거나 파일 위쪽 `COMMENT_SCOPE` 를 `"heating"` / `"all"` 로 둡니다.
+   - `3) 1번 + Note 누락 판단`: EHT LIST 에 있는 행인데 비교한 TI 품목 **모두** Note 에 히팅 표시가 없으면, Note 가
+     빠진 것으로 보고 그 품목 모두에 적습니다 (반영결과에 `품목 행에 적음 (Note 누락으로 봄)`).
+     그 외(히팅 구간과 아닌 구간이 섞인 행, TI 에만 있는 `EHT에 없음` 행)는 1번과 같습니다.
+   - 붙일 TI 품목이 없는 COMMENT(TI에 ISO 없음 등, TI에 없는 라인)는 1, 2, 3 모두 **데이터 끝에 추가**합니다.
+   - 묻지 않게 하려면 실행할 때 `--heating` / `--all` / `--note-missing` 을 붙이거나 파일 위쪽 `COMMENT_SCOPE` 를
+     `"heating"` / `"all"` / `"note-missing"` 으로 둡니다.
 4. `OUTPUT TI COMMENT` 폴더에 `원래이름_COMMENT.xlsx` 가 만들어집니다. 원본 TI-LST 는 바뀌지 않습니다.
 
 | EHT비교 행 | TI-LST 에 적는 곳 (O열) |
@@ -121,7 +125,7 @@ TI 최소 두께 `20`, 두께 변경 필요 `Y`, 내용 `EHT 두께가 아닌 �
   두께가 여러 개 적혀 있으면(예: `40 -> 50mm`) 모든 품목에 적습니다. 끄려면 `SKIP_SAME_THICKNESS = False`.
 - 어디에 적었는지는 `OUTPUT TI COMMENT/COMMENT_반영결과_날짜_시간.xlsx` 에 남습니다
   (적지 못한 COMMENT 와 이유, 이미 같은 두께라 `적지 않음 (이미 50mm)` 인 품목,
-  히팅 표시가 없어 `적지 않음 (전기히팅 표시 없음)` 인 품목 포함).
+  히팅 표시가 없어 `적지 않음 (전기히팅 표시 없음)` 인 품목, 3번에서 `Note 누락으로 봄` 으로 적은 품목 포함).
   TI 품목마다 TI 도서의 품명·Size·DN·두께·`Length (m)`·`Volume of thermal insulation layer (m³)`·`Note` 도
   같이 나옵니다 (Length·체적은 숫자로 들어가서 엑셀에서 바로 합계를 낼 수 있음).
 
@@ -141,7 +145,7 @@ TI 최소 두께 `20`, 두께 변경 필요 `Y`, 내용 `EHT 두께가 아닌 �
 - 설정(파일 위쪽): `COMMENT_FILE_KEYWORD`, `OUTPUT_FOLDER`, `OUTPUT_SUFFIX`, `COMMENT_COLUMN`(기본 `O`),
   `COMMENT_HEADER`(머리글), `COMMENT_COLUMN_WIDTH`(O열 너비), `HIGHLIGHT_COLOR`(음영 색, `None` 이면 음영 없이
   O열 '비어 있지 않음' 필터), `FILTER_COMMENT_ROWS`(필터), `NORMAL_VIEW`(기본 보기),
-  `SKIP_SAME_THICKNESS`(같은 두께 품목 제외), `COMMENT_SCOPE`(적을 품목: `None` 시작할 때 물어봄 / `"heating"` / `"all"`),
+  `SKIP_SAME_THICKNESS`(같은 두께 품목 제외), `COMMENT_SCOPE`(적을 품목: `None` 시작할 때 물어봄 / `"heating"` / `"all"` / `"note-missing"`),
   `APPEND_FORMAT`(데이터 끝에 추가할 때 형식, 기본은 COMMENT 만. 예: `"{iso} / {line} / DN {dn}: {comment}"`)
 
 ## Nominal Diameter(DN) 지정 규칙

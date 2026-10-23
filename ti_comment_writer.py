@@ -15,7 +15,9 @@
   - COMMENT 에 두께(예: 'thickness shall be 50mm')가 하나만 적혀 있으면 이미 그 두께인 품목에는 적지 않음
   - 시작할 때 고름: 1) Note 에 전기히팅 표시(There is electric heating)가 있는 품목에만 적기 (기본)
                     2) 비교한 품목 전체에 적기
-    (실행할 때 --heating / --all 을 붙이거나 COMMENT_SCOPE 설정으로 묻지 않게 할 수 있음)
+                    3) 1번 + Note 누락 판단: EHT LIST 에 있는 행인데 비교한 TI 품목 모두 히팅 표시가 없으면
+                       Note 가 빠진 것으로 보고 그 품목 모두에 적기 (그 외는 1번과 같음)
+    (실행할 때 --heating / --all / --note-missing 을 붙이거나 COMMENT_SCOPE 설정으로 묻지 않게 할 수 있음)
 
 결과 파일 모양
   - O열 머리글 'Comment' (N열 Note 머리글과 같은 서식, 노란색), COMMENT 행과 그 품목의 라인 머리글 행
@@ -60,9 +62,14 @@ FILTER_COMMENT_ROWS = True           # True: COMMENT 행과 그 라인 머리글
 NORMAL_VIEW = True                   # True: '기본' 보기로 저장 (페이지 나누기 미리 보기를 풀어 보기 쉽게)
 SKIP_SAME_THICKNESS = True           # True: COMMENT 의 두께(예: 50mm)와 이미 같은 두께인 품목에는 안 적음
 APPEND_FORMAT = "{comment}"          # 데이터 끝에 추가하는 COMMENT 형식 (예: "{iso} / {line} / DN {dn}: {comment}")
-COMMENT_SCOPE = None                 # None: 시작할 때 물어봄 / "heating": 전기히팅 표시 품목에만 / "all": 비교한 품목 전체
+COMMENT_SCOPE = None                 # 적을 품목 (None: 시작할 때 물어봄) "heating" 1번 / "all" 2번 / "note-missing" 3번
 
 
+SCOPE_NAMES = {
+    "heating": "1) 전기히팅 표시 품목에만",
+    "all": "2) 비교한 품목 전체",
+    "note-missing": "3) 전기히팅 표시 품목에만 + Note 누락 판단",
+}
 REPORT_KEY_COLUMNS = ("ISO NO", "DN", "TI LINE NO", "TI 파일")  # EHT비교 시트인지 확인하는 머리글
 ISO_SERIAL_RE = re.compile(r"^(.*-ISO)-(\d+)(?:-\d{2})?$")     # ...-TKM-ISO-00007-01 -> (...-TKM-ISO, 7)
 
@@ -135,13 +142,22 @@ def comment_iso(rec):
     return iso
 
 
-def comment_targets(rec, groups, known_files, heating_only=True):
-    """EHT비교 한 행에서 비교했던 TI 품목들 -> (COMMENT 를 적을 품목, 전기히팅 표시가 없어 뺀 품목).
+def in_eht_list(rec):
+    """EHT LIST 에 있는 행인지 (TI 에만 있어서 'EHT에 없음' 으로 나온 행이 아닌지)"""
+    if "EHT 행" in rec:
+        return ti.clean_text(rec["EHT 행"]) != ""
+    return ti.clean_text(rec.get("판정")) != "EHT에 없음"
+
+
+def comment_targets(rec, groups, known_files, scope="heating"):
+    """EHT비교 한 행에서 비교했던 TI 품목들
+    -> (COMMENT 를 적을 품목, 전기히팅 표시가 없어 뺀 품목, Note 누락으로 보고 전체에 적는지).
 
     EHT비교의 TI LINE NO / TI 보온구분 / TI 파일 은 비교에 쓴 품목에서 나온 값이므로 그 값으로 다시 고르고,
     비교 때처럼 제외(Excluded) 라인은 뺀다(그것만 있으면 그대로).
-    heating_only: Note 에 전기히팅 표시가 있는 품목에만 적음 (한 라인에 히팅 구간과 아닌 구간이 섞여 있어도
-    히팅 구간만 바뀌게). False 면 비교한 품목 전체에 적음."""
+    scope "heating": Note 에 전기히팅 표시가 있는 품목에만 적음 (한 라인에 히팅 구간과 아닌 구간이 섞여 있어도
+    히팅 구간만 바뀌게) / "all": 비교한 품목 전체 / "note-missing": heating 과 같되, EHT LIST 에 있는 행인데
+    비교한 품목 모두 히팅 표시가 없으면 Note 가 빠진 것으로 보고 전체에 적음."""
     entries = groups.get((comment_iso(rec), ti.dn_number(rec.get("DN"))), [])
     files = set(split_names(rec.get("TI 파일"), known_files))
     lines = set(split_names(rec.get("TI LINE NO")))
@@ -149,9 +165,12 @@ def comment_targets(rec, groups, known_files, heating_only=True):
     picked = [e for e in entries
               if e["file"] in files and e["line"] in lines and (not types or e["type"] in types)]
     picked = [e for e in picked if not e["excluded"]] or picked
-    if not heating_only:
-        return picked, []
-    return [e for e in picked if e["heating"]], [e for e in picked if not e["heating"]]
+    if scope == "all":
+        return picked, [], False
+    heated = [e for e in picked if e["heating"]]
+    if picked and not heated and scope == "note-missing" and in_eht_list(rec):
+        return picked, [], True
+    return heated, [e for e in picked if not e["heating"]], False
 
 
 def ti_groups(items):
@@ -872,27 +891,26 @@ def log_row(result, rec, **extra):
     return row
 
 
-def choose_heating_only(args):
-    """COMMENT 를 전기히팅 표시 품목에만 적을지(True) 비교한 품목 전체에 적을지(False)"""
-    if "--heating" in args or COMMENT_SCOPE == "heating":
-        return True
-    if "--all" in args or COMMENT_SCOPE == "all":
-        return False
+def choose_scope(args):
+    """COMMENT 를 적을 품목: "heating"(1) / "all"(2) / "note-missing"(3)"""
+    for scope in SCOPE_NAMES:
+        if f"--{scope}" in args or COMMENT_SCOPE == scope:
+            return scope
     print("\nCOMMENT 를 어느 품목에 적을까요?")
     print("  1) TI Note 에 전기히팅 표시(There is electric heating / Имеется электрообогрев)가 있는 품목에만 (기본)")
     print("     - 한 라인에 히팅 구간과 아닌 구간이 섞여 있으면 히팅 구간만 적고, 히팅 표시 품목이 없으면 적지 않음")
     print("  2) 비교한 품목 전체 (히팅 표시가 없는 품목 포함)")
-    print("  (붙일 TI 품목이 없는 COMMENT(TI에 없는 라인)는 1, 2 모두 데이터 끝에 추가)")
+    print("  3) 1번 + Note 누락 판단: EHT LIST 에 있는 행인데 비교한 TI 품목 모두 히팅 표시가 없으면")
+    print("     Note 가 빠진 것으로 보고 그 품목 모두에 적음 (그 외는 1번과 같음)")
+    print("  (붙일 TI 품목이 없는 COMMENT(TI에 없는 라인)는 1, 2, 3 모두 데이터 끝에 추가)")
     while True:
         try:
             answer = input("번호 입력 (엔터 = 1): ").strip()
         except EOFError:  # 입력 창이 없으면 기본값
-            return True
-        if answer in ("", "1"):
-            return True
-        if answer == "2":
-            return False
-        print("1 또는 2 를 입력해 주세요.")
+            return "heating"
+        if answer in ("", "1", "2", "3"):
+            return list(SCOPE_NAMES)[int(answer or 1) - 1]
+        print("1, 2, 3 중에 입력해 주세요.")
 
 
 def main():
@@ -903,8 +921,8 @@ def main():
     print(f"작업 폴더: {base_dir}")
 
     # 1) COMMENT 파일 읽기 (끌어다 놓은 파일, 없으면 폴더에서 파일명에 COMMENT 가 있는 엑셀)
-    heating_only = choose_heating_only(sys.argv[1:])
-    print("적용 범위: " + ("전기히팅 표시 품목에만" if heating_only else "비교한 품목 전체"))
+    scope = choose_scope(sys.argv[1:])
+    print("적용 범위: " + SCOPE_NAMES[scope])
     comment_files = [Path(a) for a in sys.argv[1:] if a.lower().endswith(".xlsx")] or sorted(
         f for f in base_dir.glob("*.xlsx")
         if COMMENT_FILE_KEYWORD.lower() in f.name.lower() and not f.name.startswith("~$"))
@@ -934,9 +952,9 @@ def main():
     items = parse_ti_files(first) if first else []
 
     groups = ti_groups(items)
-    targets = [comment_targets(rec, groups, by_name, heating_only) for rec in comments]
+    targets = [comment_targets(rec, groups, by_name, scope) for rec in comments]
     if any(not picked and not no_heating and not split_names(rec.get("TI 파일"))
-           for rec, (picked, no_heating) in zip(comments, targets)):
+           for rec, (picked, no_heating, _) in zip(comments, targets)):
         rest = [f for f in ti_files if f.name not in named]
         if rest:
             print(f"TI 파일이 없는 COMMENT(TI에 ISO 없음 등)가 있어 같은 구역 TI-LST 를 찾으려고 나머지도 읽습니다 "
@@ -956,8 +974,9 @@ def main():
     row_texts = defaultdict(lambda: defaultdict(list))   # 파일 -> 품목 행 -> [COMMENT]
     row_comments = defaultdict(list)                      # (파일, 행) -> [COMMENT 행 레코드]
     appends = defaultdict(list)                           # 파일 -> [(글자, COMMENT 행 레코드)]
+    note_missing = set()                                  # Note 누락으로 보고 적은 COMMENT (파일, 행)
     log = []
-    for rec, (picked, no_heating) in zip(comments, targets):
+    for rec, (picked, no_heating, missing) in zip(comments, targets):
         for e in no_heating:
             log.append(log_row("적지 않음 (전기히팅 표시 없음)", rec, **item_info(item_of[(e["file"], e["row"])])))
         if picked:
@@ -971,6 +990,8 @@ def main():
                     continue
                 row_texts[e["file"]][e["row"]].append(rec["COMMENT"])
                 row_comments[(e["file"], e["row"])].append(rec)
+                if missing:
+                    note_missing.add((rec["COMMENT 파일"], rec["COMMENT 행"]))
             continue
         if no_heating:
             continue
@@ -1011,8 +1032,13 @@ def main():
         saved += 1
         print(f"저장: {out_path.name} (품목 {len(row_texts.get(name, {}))}행, 데이터 끝에 추가 {len(appended)}행)")
         for row in sorted(row_texts.get(name, {})):
-            result = "품목 행에 적음 (기존 값 뒤에 붙임)" if had_old[row] else "품목 행에 적음"
             for rec in row_comments[(name, row)]:
+                notes = []
+                if had_old[row]:
+                    notes.append("기존 값 뒤에 붙임")
+                if (rec["COMMENT 파일"], rec["COMMENT 행"]) in note_missing:
+                    notes.append("Note 누락으로 봄")
+                result = "품목 행에 적음" + (f" ({', '.join(notes)})" if notes else "")
                 log.append(log_row(result, rec, **item_info(item_of[(name, row)]), **{"저장 파일": out_path.name}))
         for row, (_, rec) in zip(appended, appends.get(name, [])):
             log.append(log_row("데이터 끝에 추가", rec, **{
@@ -1032,6 +1058,9 @@ def main():
             skipped[rec["결과"]] += 1
     for result, count in skipped.items():
         print(f"{result}: {count}건 - {log_path.name} 의 '결과' 열 확인")
+    if note_missing:
+        print(f"Note 누락으로 보고 적은 COMMENT: {len(note_missing)}건 "
+              "(EHT LIST 에 있는데 TI 품목 모두 전기히팅 표시 없음)")
     failed = sum(1 for rec in log if not rec["결과"].startswith(("품목 행", "데이터 끝", "적지 않음")))
     if failed:
         print(f"!! 적지 못한 COMMENT {failed}건 - {log_path.name} 의 '결과' 열 확인")
