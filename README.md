@@ -126,8 +126,9 @@ TI 최소 두께 `20`, 두께 변경 필요 `Y`, 내용 `EHT 두께가 아닌 �
 - 어디에 적었는지는 `OUTPUT TI COMMENT/COMMENT_반영결과_날짜_시간.xlsx` 에 남습니다
   (적지 못한 COMMENT 와 이유, 이미 같은 두께라 `적지 않음 (이미 50mm)` 인 품목,
   히팅 표시가 없어 `적지 않음 (전기히팅 표시 없음)` 인 품목, 3번에서 `Note 누락으로 봄` 으로 적은 품목 포함).
-  TI 품목마다 TI 도서의 품명·Size·DN·두께·`Length (m)`·`Volume of thermal insulation layer (m³)`·`Note` 도
-  같이 나옵니다 (Length·체적은 숫자로 들어가서 엑셀에서 바로 합계를 낼 수 있음).
+  TI 품목마다 TI 도서의 품명·Size·DN·`Name (designation)`(H열 보온재 이름)·두께·`Length (m)`·
+  `Volume of thermal insulation layer (m³)`·`Note` 도 같이 나옵니다
+  (Length·체적은 숫자로 들어가서 엑셀에서 바로 합계를 낼 수 있음).
 
 결과 파일 모양
 

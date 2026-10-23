@@ -74,7 +74,7 @@ REPORT_KEY_COLUMNS = ("ISO NO", "DN", "TI LINE NO", "TI 파일")  # EHT비교 �
 ISO_SERIAL_RE = re.compile(r"^(.*-ISO)-(\d+)(?:-\d{2})?$")     # ...-TKM-ISO-00007-01 -> (...-TKM-ISO, 7)
 
 LOG_COLUMNS = [
-    "결과", "COMMENT", "TI 파일", "TI 행", "품명", "Size (mm)", "Nominal Diameter", "두께 (mm)",
+    "결과", "COMMENT", "TI 파일", "TI 행", "품명", "Size (mm)", "Nominal Diameter", "Name (designation)", "두께 (mm)",
     "Length (m)", "Volume of thermal insulation layer (m³)", "Note",
     "LINE NO", "ISO NO", "DN", "판정", "EHT 라인", "COMMENT 파일", "COMMENT 행", "저장 파일",
 ]
@@ -872,10 +872,10 @@ def number_or_text(value):
 
 
 def item_info(item):
-    """반영 결과에 남길 TI 품목 정보 (TI 도서의 Length·보온층 체적·Note 포함)"""
+    """반영 결과에 남길 TI 품목 정보 (TI 도서의 Name(보온재)·Length·보온층 체적·Note 포함)"""
     return {"TI 파일": item["Source File"], "TI 행": item["Source Start Row"], "품명": item["Item Name"],
             "Size (mm)": item["Size (mm)"], "Nominal Diameter": item["Nominal Diameter"],
-            "두께 (mm)": item["Insulation Thickness (mm)"],
+            "Name (designation)": item["Insulation Material"], "두께 (mm)": item["Insulation Thickness (mm)"],
             "Length (m)": number_or_text(item["Length/Height (m)"]),
             "Volume of thermal insulation layer (m³)": number_or_text(item["Volume of Insulation Layer (m³)"]),
             "Note": item["Note"], "LINE NO": item["LINE NO"]}
